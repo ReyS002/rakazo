@@ -24,6 +24,16 @@ export default defineConfig({
   reporter: reporters,
   use: {
     baseURL,
+    // The product opens dark; the suite follows the emulated system scheme unless a spec opts out.
+    storageState: {
+      cookies: [],
+      origins: [
+        {
+          origin: new URL(baseURL).origin,
+          localStorage: [{ name: "rakazo.uiAppearance", value: "system" }],
+        },
+      ],
+    },
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",

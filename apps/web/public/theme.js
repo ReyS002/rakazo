@@ -1,7 +1,8 @@
 // Runs before first paint, as a file because the app's CSP blocks inline scripts.
 (() => {
   const key = "rakazo.uiAppearance";
-  let preference = "system";
+  // Matches DEFAULT_APPEARANCE_PREFERENCE in @rakazo/ui-tokens.
+  let preference = "dark";
   try {
     const stored = localStorage.getItem(key);
     if (stored === "system" || stored === "light" || stored === "dark") preference = stored;

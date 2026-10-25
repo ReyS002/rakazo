@@ -6,6 +6,9 @@ export type ResolvedAppearance = "light" | "dark";
 
 export const UI_APPEARANCE_STORAGE_KEY = "rakazo.uiAppearance";
 
+/** A trading desk opens dark until the user picks light or System. */
+export const DEFAULT_APPEARANCE_PREFERENCE: AppearancePreference = "dark";
+
 /**
  * Semantic palette shared by web, Electron, and Expo. Names follow the shadcn
  * convention so the same slot means the same thing on every surface: a `border`
@@ -294,7 +297,7 @@ export function isAppearancePreference(
 export function normalizeAppearancePreference(
   raw: string | null | undefined,
 ): AppearancePreference {
-  return isAppearancePreference(raw) ? raw : "system";
+  return isAppearancePreference(raw) ? raw : DEFAULT_APPEARANCE_PREFERENCE;
 }
 
 export type ResolveAppearancePreferenceOptions = {

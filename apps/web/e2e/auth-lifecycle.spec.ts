@@ -119,6 +119,25 @@ test("signed-out welcome fits a narrow phone and offers sign in", async ({ page 
   await expect(page.getByRole("heading", { name: "Sign in to Bull Desk" })).toBeVisible();
 });
 
+test.describe("first visit", () => {
+  test.use({ colorScheme: "light", storageState: { cookies: [], origins: [] } });
+
+  test("opens dark with the logo and a primary sign-up call to action", async ({
+    page,
+  }, testInfo) => {
+    await page.route("**/api/auth/get-session**", (route) => route.fulfill({ json: null }));
+    await page.goto("/");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    const main = page.getByRole("main");
+    await expect(main.getByRole("img", { name: "Bull Desk" })).toBeVisible();
+    await expect(main.getByRole("button", { name: "Sign up", exact: true })).toHaveCSS(
+      "background-color",
+      "rgb(212, 175, 55)",
+    );
+    await captureScreenshot(page, testInfo, "logged-out-welcome-dark");
+  });
+});
+
 test("logout protects bot deep links and sign-in restores the session", async ({
   page,
 }, testInfo) => {

@@ -8,7 +8,6 @@ export {
   defaultBotAvatarValue,
   parseBotAvatar,
   resolvePersonaColorDef,
-  Wordmark,
 } from "./bot-avatar.js";
 export * from "./components/ui/alert-dialog.js";
 export * from "./components/ui/badge.js";

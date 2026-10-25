@@ -5,6 +5,7 @@ import type { ColorTokens } from "./index.js";
 import {
   botColors,
   cssVariableName,
+  DEFAULT_APPEARANCE_PREFERENCE,
   darkTokens,
   lightTokens,
   normalizeAppearancePreference,
@@ -22,10 +23,12 @@ import {
 } from "./index.js";
 
 describe("appearance preference", () => {
-  it("defaults unknown values to system", () => {
-    expect(normalizeAppearancePreference(null)).toBe("system");
-    expect(normalizeAppearancePreference("nope")).toBe("system");
+  it("defaults unknown values to dark and keeps explicit choices", () => {
+    expect(DEFAULT_APPEARANCE_PREFERENCE).toBe("dark");
+    expect(normalizeAppearancePreference(null)).toBe("dark");
+    expect(normalizeAppearancePreference("nope")).toBe("dark");
     expect(normalizeAppearancePreference("light")).toBe("light");
+    expect(normalizeAppearancePreference("system")).toBe("system");
   });
 
   it("resolves system from the platform scheme", () => {
@@ -42,7 +45,7 @@ describe("appearance preference", () => {
         store.set(key, value);
       },
     };
-    expect(resolveAppearancePreference({ storage })).toBe("system");
+    expect(resolveAppearancePreference({ storage })).toBe("dark");
     persistAppearancePreference("light", storage);
     expect(store.get(UI_APPEARANCE_STORAGE_KEY)).toBe("light");
     expect(resolveAppearancePreference({ storage })).toBe("light");
@@ -108,9 +111,9 @@ describe("appearance preference", () => {
       },
     });
     try {
-      expect(resolveAppearancePreference()).toBe("system");
+      expect(resolveAppearancePreference()).toBe("dark");
       persistAppearancePreference("light");
-      expect(resolveAppearancePreference()).toBe("system");
+      expect(resolveAppearancePreference()).toBe("dark");
     } finally {
       if (desc) Object.defineProperty(globalThis, "localStorage", desc);
       else delete (globalThis as { localStorage?: Storage }).localStorage;
