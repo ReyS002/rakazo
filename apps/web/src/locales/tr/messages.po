@@ -647,8 +647,8 @@ msgid "An API key is stored for this provider, not a subscription sign-in."
 msgstr "Bu sağlayıcı için abonelik girişi değil, bir API anahtarı saklanıyor."
 
 #: src/pages/memory-providers/HonchoSettingsForm.tsx
-msgid "An existing Honcho peer to read from. Rakazo never writes to it."
-msgstr "Verilerin okunacağı mevcut bir Honcho eşi. Rakazo bu eşe asla veri yazmaz."
+msgid "An existing Honcho peer to read from. Bull Desk never writes to it."
+msgstr "Verilerin okunacağı mevcut bir Honcho eşi. Bull Desk bu eşe asla veri yazmaz."
 
 #: src/lib/agent-import-errors.ts
 msgid "An imported API key could not be checked. Try again."
@@ -980,6 +980,11 @@ msgstr ""
 msgid "Built-in"
 msgstr "Yerleşik"
 
+#: src/components/ModelCredits.tsx
+#: src/pages/Onboarding.tsx
+msgid "Bull Desk credits"
+msgstr ""
+
 #: src/pages/Shell.tsx
 msgid "Call"
 msgstr ""
@@ -1196,7 +1201,7 @@ msgid "Choose folder"
 msgstr "Klasör seç"
 
 #: src/components/ModelCredits.tsx
-msgid "Choose how to use Rakazo"
+msgid "Choose how to use Bull Desk"
 msgstr ""
 
 #: src/lib/localized-provider-hint.ts
@@ -2055,8 +2060,8 @@ msgid "Create space"
 msgstr ""
 
 #: src/pages/Auth.tsx
-msgid "Create your Rakazo"
-msgstr "Rakazo hesabını oluştur"
+msgid "Create your Bull Desk"
+msgstr "Bull Desk hesabını oluştur"
 
 #: src/components/AskCard.tsx
 msgid "Created"
@@ -2702,10 +2707,6 @@ msgstr "Ağ geçidi kimliği"
 msgid "General"
 msgstr "Genel"
 
-#: src/components/SidebarFooter.tsx
-msgid "Get the mobile app"
-msgstr "Mobil uygulamayı indir"
-
 #: src/components/ComputerUpdateProgress.tsx
 msgid "Getting ready"
 msgstr ""
@@ -2829,7 +2830,7 @@ msgid "How to check"
 msgstr "Nasıl kontrol edilir"
 
 #: src/components/SignupSurvey.tsx
-msgid "How will you use Rakazo?"
+msgid "How will you use Bull Desk?"
 msgstr ""
 
 #: src/pages/shell/computer-release-actions.tsx
@@ -3720,8 +3721,8 @@ msgid "Not imported"
 msgstr "İçe aktarılmadı"
 
 #: src/pages/shell/import-status.ts
-msgid "Not in Rakazo's catalog"
-msgstr "Rakazo kataloğunda yok"
+msgid "Not in Bull Desk's catalog"
+msgstr "Bull Desk kataloğunda yok"
 
 #: src/pages/PluginsOverlay.tsx
 msgid "Not in the plugin catalog"
@@ -3733,12 +3734,12 @@ msgstr "Şimdi değil"
 
 #: src/pages/shell/agent-import.tsx
 #: src/pages/shell/import-status.ts
-msgid "Not supported in Rakazo"
-msgstr "Rakazo'da desteklenmiyor"
+msgid "Not supported in Bull Desk"
+msgstr "Bull Desk'da desteklenmiyor"
 
 #: src/pages/shell/agent-import.tsx
-msgid "Not used by Rakazo"
-msgstr "Rakazo tarafından kullanılmıyor"
+msgid "Not used by Bull Desk"
+msgstr "Bull Desk tarafından kullanılmıyor"
 
 #: src/components/McpServerHealthLine.tsx
 msgid "Not working"
@@ -3958,8 +3959,8 @@ msgid "Paste a replacement key"
 msgstr "Yeni bir anahtar yapıştır"
 
 #: src/pages/model-settings/compatible-model-fields.tsx
-msgid "Paste the OpenAI-compatible address from your server. Rakazo adds /v1 if needed."
-msgstr "Sunucundaki OpenAI uyumlu adresi yapıştır. Gerekirse Rakazo /v1 ekler."
+msgid "Paste the OpenAI-compatible address from your server. Bull Desk adds /v1 if needed."
+msgstr "Sunucundaki OpenAI uyumlu adresi yapıştır. Gerekirse Bull Desk /v1 ekler."
 
 #: src/pages/shell/agent-import.tsx
 msgid "Paste the reply"
@@ -4102,13 +4103,8 @@ msgstr "Çekme isteği"
 msgid "Queued"
 msgstr "Kuyrukta"
 
-#: src/components/ModelCredits.tsx
-#: src/pages/Onboarding.tsx
-msgid "Rakazo credits"
-msgstr ""
-
 #: src/pages/memory-providers/HonchoSettingsForm.tsx
-msgid "rakazo-shared and IDs starting with bot- are reserved for Rakazo."
+msgid "rakazo-shared and IDs starting with bot- are reserved for Bull Desk."
 msgstr ""
 
 #: src/pages/shell/message-hover-actions.tsx
@@ -4462,14 +4458,14 @@ msgstr "Şimdi tekrar dene"
 msgid "Retry screen"
 msgstr ""
 
+#: src/pages/McpOAuthCallback.tsx
+msgid "Return to Bull Desk"
+msgstr "Bull Desk'ya dön"
+
 #. placeholder {0}: call.botName
 #: src/components/call/CallCard.tsx
 msgid "Return to call with {0}"
 msgstr ""
-
-#: src/pages/McpOAuthCallback.tsx
-msgid "Return to Rakazo"
-msgstr "Rakazo'ya dön"
 
 #: src/lib/model-connection-preflight.ts
 msgid "Review provider settings and test again."
@@ -4854,8 +4850,8 @@ msgid "Sign in at <0>{0}</0>, then paste the code here."
 msgstr "<0>{0}</0> adresinde oturum açın, ardından kodu buraya yapıştırın."
 
 #: src/pages/Auth.tsx
-msgid "Sign in to Rakazo"
-msgstr "Rakazo'da oturum aç"
+msgid "Sign in to Bull Desk"
+msgstr "Bull Desk'da oturum aç"
 
 #: src/lib/user-error.ts
 msgid "Sign in to your existing account to link SSO"
@@ -5292,8 +5288,8 @@ msgid "This server is already connected. Disconnect it first to authorize again.
 msgstr "Bu sunucu zaten bağlı. Yeniden yetkilendirmek için önce bağlantısını kes."
 
 #: src/pages/model-settings/connection-controls.tsx
-msgid "This subscription sign-in is not available in Rakazo yet. Use a deployment credential or choose another provider."
-msgstr "Bu abonelik girişi Rakazo'da henüz kullanılamıyor. Bir dağıtım kimlik bilgisi kullan veya başka bir sağlayıcı seç."
+msgid "This subscription sign-in is not available in Bull Desk yet. Use a deployment credential or choose another provider."
+msgstr "Bu abonelik girişi Bull Desk'da henüz kullanılamıyor. Bir dağıtım kimlik bilgisi kullan veya başka bir sağlayıcı seç."
 
 #: src/pages/Artifacts.tsx
 msgid "This week"
@@ -5547,6 +5543,10 @@ msgstr "Erişim belirteci için {oauthEnvReference} kullanın."
 msgid "Use a found model"
 msgstr "Bulunan bir modeli kullan"
 
+#: src/components/ModelCredits.tsx
+msgid "Use Bull Desk credits"
+msgstr ""
+
 #: src/lib/model-connection-preflight.ts
 msgid "Use Connect to verify the key."
 msgstr "Anahtarı doğrulamak için Bağlan'ı kullan."
@@ -5569,10 +5569,6 @@ msgstr ""
 
 #: src/components/teach/TeachRecordingChrome.tsx
 msgid "Use Protected input for passwords."
-msgstr ""
-
-#: src/components/ModelCredits.tsx
-msgid "Use Rakazo credits"
 msgstr ""
 
 #: src/pages/model-settings/space-bots-model.tsx
@@ -5674,7 +5670,7 @@ msgid "Weekdays"
 msgstr "Hafta içi"
 
 #: src/components/SignupSurvey.tsx
-msgid "Welcome to Rakazo"
+msgid "Welcome to Bull Desk"
 msgstr ""
 
 #: src/pages/shell/dialogs.tsx
@@ -5682,7 +5678,7 @@ msgid "What about its memories?"
 msgstr "Hafızası ne olsun?"
 
 #: src/components/SignupSurvey.tsx
-msgid "What do you most want Rakazo to help with?"
+msgid "What do you most want Bull Desk to help with?"
 msgstr ""
 
 #: src/pages/shell/message-cards.tsx

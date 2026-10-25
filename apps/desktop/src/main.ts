@@ -544,7 +544,7 @@ function oauthPopupWindowOptions(partition: string | null) {
     frame: true,
     titleBarStyle: "default" as const,
     autoHideMenuBar: true,
-    backgroundColor: "#161616",
+    backgroundColor: "#0B1220",
     webPreferences: oauthPopupSessionPreferences(partition),
   };
 }
@@ -624,7 +624,7 @@ async function runMenuUpdateCheck() {
       : dialog.showMessageBox(options);
   if (state.phase === "ready") {
     const { response } = await alert({
-      message: `Rakazo ${state.availableVersion} is ready to install.`,
+      message: `Bull Desk ${state.availableVersion} is ready to install.`,
       buttons: ["Restart", "Later"],
       defaultId: 0,
       cancelId: 1,
@@ -647,7 +647,7 @@ async function runMenuUpdateCheck() {
       detail: state.message,
     });
   } else if (state.phase === "idle") {
-    await alert({ message: "Rakazo is up to date.", detail: `Version ${state.currentVersion}` });
+    await alert({ message: "Bull Desk is up to date.", detail: `Version ${state.currentVersion}` });
   }
 }
 
@@ -684,7 +684,7 @@ function installApplicationMenu() {
   };
   const changeServer: Electron.MenuItemConstructorOptions = {
     id: "change-rakazo-server",
-    label: "Change Rakazo Server…",
+    label: "Change Bull Desk Server…",
     accelerator: "CmdOrCtrl+Shift+K",
     click: () => showSetupWindow(),
   };
@@ -770,7 +770,7 @@ function installApplicationMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-/** Setup IPC must only answer the setup window, never a connected Rakazo server. */
+/** Setup IPC must only answer the setup window, never a connected Bull Desk server. */
 function fromSetupWindow(event: Electron.IpcMainInvokeEvent) {
   return (
     setupWindow !== null && !setupWindow.isDestroyed() && event.sender === setupWindow.webContents
@@ -797,7 +797,7 @@ async function probeServer(rawUrl: string, signal?: AbortSignal): Promise<Deskto
         ok: false,
         status: response.status,
         url,
-        error: "That address redirects elsewhere. Enter the final Rakazo server address.",
+        error: "That address redirects elsewhere. Enter the final Bull Desk server address.",
       };
     }
     if (!response.ok) {
@@ -814,7 +814,7 @@ async function probeServer(rawUrl: string, signal?: AbortSignal): Promise<Deskto
         ok: false,
         status: response.status,
         url,
-        error: "That address did not respond like a Rakazo server.",
+        error: "That address did not respond like a Bull Desk server.",
       };
     }
     return {
@@ -1319,7 +1319,7 @@ app.whenReady().then(async () => {
         if (managedUrl === null || !(await localStack.matchesDesiredStack())) {
           return {
             ok: false,
-            error: "The app-managed Rakazo services are not ready. Retry setup.",
+            error: "The app-managed Bull Desk services are not ready. Retry setup.",
           };
         }
         openSetup = { mode: "new", serverUrl: managedUrl };
