@@ -1,0 +1,18 @@
+# EXAMPLE ONLY - not installed. health + scanner + logs (no network needed: docker socket is AF_UNIX).
+[Unit]
+Description=Bull Desk oversight collector (health, scanner, logs)
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 -I /opt/stacks/bull-desk/observer/collect.py --only health,scanner,logs --once
+TimeoutStartSec=90
+Nice=10
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/stacks/bull-desk/hermes-bridge-run/observe
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any

@@ -1,0 +1,19 @@
+# EXAMPLE ONLY - not installed. paper (GET-only HTTPS to paper-api.alpaca.markets / api-fxpractice.oanda.com).
+[Unit]
+Description=Bull Desk oversight collector (paper accounts)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 -I /opt/stacks/bull-desk/observer/collect.py --only paper --once
+TimeoutStartSec=90
+Nice=10
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/stacks/bull-desk/hermes-bridge-run/observe
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

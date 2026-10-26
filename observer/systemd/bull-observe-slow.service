@@ -1,0 +1,18 @@
+# EXAMPLE ONLY - not installed. projects + vault (git + file reads, no network).
+[Unit]
+Description=Bull Desk oversight collector (projects, vault)
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 -I /opt/stacks/bull-desk/observer/collect.py --only projects,vault --once
+TimeoutStartSec=90
+Nice=15
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/stacks/bull-desk/hermes-bridge-run/observe
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any

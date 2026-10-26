@@ -1,0 +1,11 @@
+# EXAMPLE ONLY - not installed.
+[Unit]
+Description=Bull Desk oversight collector every 2 min (health, scanner, logs)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

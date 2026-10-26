@@ -1,0 +1,40 @@
+# Example service for docker-compose.vps.yml (not applied). Read/evaluate-only door
+# from TickerBull to BullWarden. See prop-desk/README.md.
+services:
+  prop-desk:
+    image: python:3.12-slim
+    command: ["python", "/app/gateway.py"]
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 96m
+    pids_limit: 64
+    # PROP_KEYS, BULLWARDEN_API_KEY (and optionally BULLWARDEN_URL) live here, never in this file.
+    env_file: /root/.hermes/credentials/bull-desk-prop.env
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      BULLWARDEN_URL: "http://bull-warden:8090"
+      PROP_KILL_DIR: "/run/prop"
+    volumes:
+      - /opt/stacks/bull-desk/prop-desk:/app:ro
+      # touch /opt/stacks/bull-desk/prop-desk-run/KILL_PROP to make every route 503.
+      - /opt/stacks/bull-desk/prop-desk-run:/run/prop:ro
+    networks: [default, bullwarden]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "bull-desk_default"
+      traefik.http.routers.bull-desk-prop.rule: "Host(`desk.72.62.169.3.nip.io`) && PathPrefix(`/prop-desk`)"
+      traefik.http.routers.bull-desk-prop.priority: "100"
+      traefik.http.routers.bull-desk-prop.entrypoints: "websecure"
+      traefik.http.routers.bull-desk-prop.tls.certresolver: "letsencrypt"
+      traefik.http.routers.bull-desk-prop.middlewares: "bull-desk-prop-strip"
+      traefik.http.middlewares.bull-desk-prop-strip.stripprefix.prefixes: "/prop-desk"
+      traefik.http.routers.bull-desk-prop.service: "bull-desk-prop"
+      traefik.http.services.bull-desk-prop.loadbalancer.server.port: "8080"
+
+networks:
+  bullwarden:
+    external: true
