@@ -1,11 +1,12 @@
-# EXAMPLE ONLY - not installed. projects + vault (git + file reads, no network).
+# EXAMPLE ONLY - not installed. projects + vault + narrow (git + file reads + read-only SQLite, no network).
+# narrow: Bull Pilot lane db opened mode=ro; if that fails it reads a copy in the private /tmp (PrivateTmp).
 [Unit]
-Description=Bull Desk oversight collector (projects, vault)
+Description=Bull Desk oversight collector (projects, vault, narrow)
 
 [Service]
 Type=oneshot
 User=root
-ExecStart=/usr/bin/python3 -I /opt/stacks/bull-desk/observer/collect.py --only projects,vault --once
+ExecStart=/usr/bin/python3 -I /opt/stacks/bull-desk/observer/collect.py --only projects,vault,narrow --once
 TimeoutStartSec=90
 Nice=15
 UMask=0022

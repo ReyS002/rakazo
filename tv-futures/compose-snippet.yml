@@ -1,0 +1,39 @@
+# Example service for docker-compose.vps.yml (not applied). TradingView futures-coil alert
+# receiver -> TickerBull webhook. Never trades, never talks to BullWarden. See tv-futures/README.md.
+services:
+  tv-futures:
+    image: python:3.12-slim
+    command: ["python", "/app/receiver.py"]
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 96m
+    pids_limit: 64
+    # TV_KEYS, BD_TICKERBULL_WEBHOOK_URL, BD_TICKERBULL_WEBHOOK_AUTH (optionally TV_SYMBOLS,
+    # TV_TIMEFRAMES, TV_TRUSTED_PROXIES) live here, never in this file.
+    env_file: /root/.hermes/credentials/bull-desk-tv.env
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      TV_KILL_DIR: "/run/tv"
+      TV_STATE_DIR: "/run/tv"
+    volumes:
+      - /opt/stacks/bull-desk/tv-futures:/app:ro
+      # rw state: alerts.jsonl (+ .1/.2), state.json. Owned by 65534.
+      # Kill switch lives here too: `touch /opt/stacks/bull-desk/tv-futures-run/KILL_TV` on the host
+      # makes every route 503 immediately (checked per request); `rm` it to resume.
+      - /opt/stacks/bull-desk/tv-futures-run:/run/tv
+    networks: [default]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "bull-desk_default"
+      traefik.http.routers.bull-desk-tv.rule: "Host(`desk.72.62.169.3.nip.io`) && PathPrefix(`/tv-futures`)"
+      traefik.http.routers.bull-desk-tv.priority: "100"
+      traefik.http.routers.bull-desk-tv.entrypoints: "websecure"
+      traefik.http.routers.bull-desk-tv.tls.certresolver: "letsencrypt"
+      traefik.http.routers.bull-desk-tv.middlewares: "bull-desk-tv-strip"
+      traefik.http.middlewares.bull-desk-tv-strip.stripprefix.prefixes: "/tv-futures"
+      traefik.http.routers.bull-desk-tv.service: "bull-desk-tv"
+      traefik.http.services.bull-desk-tv.loadbalancer.server.port: "8080"

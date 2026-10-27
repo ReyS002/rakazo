@@ -1,10 +1,10 @@
 # observer: oversight feed collector
 
-Trusted, host-side, read-only. Writes six sanitized JSON snapshots for the relay
+Trusted, host-side, read-only. Writes seven sanitized JSON snapshots for the relay
 (`GET` with bearer key; mounted read-only at `/run/bridge/observe/`). Spec: `observe-spec.md` (oversight feed v1).
 
 ```sh
-python3 -I collect.py [--only health,scanner,paper,projects,vault,logs] [--out DIR] [--once]
+python3 -I collect.py [--only health,scanner,paper,projects,vault,logs,narrow] [--out DIR] [--once]
 # default out: /opt/stacks/bull-desk/hermes-bridge-run/observe
 python3 -m unittest discover -s /opt/stacks/bull-desk/observer/tests
 ```
@@ -13,10 +13,10 @@ python3 -m unittest discover -s /opt/stacks/bull-desk/observer/tests
 
 ## Output
 
-`<name>.json` for `health scanner paper projects vault logs` only. Each file is
-`{"name","generated_at","ok","error","data"}`, max 200 KB (longest lists are halved until it fits),
+`<name>.json` for `health scanner paper projects vault logs narrow` only. Each file is
+`{"name","generated_at","ok","error","data"}`, max 200 KB (`narrow`: 150 KB) (longest lists are halved until it fits),
 written atomically (tmp + `os.replace`, fsync, 0644; dir 0755). Leftover `.tmp` files older than 10 min are removed.
-`.<name>.lock` files (0600) sit next to the snapshots; the relay only serves the six fixed names.
+`.<name>.lock` files (0600) sit next to the snapshots; the relay only serves the seven fixed names (`narrow` added to `OBSERVE_NAMES` in hermes-bridge/relay.py).
 
 - A section that raises -> `ok:false`, short scrubbed `error`, `data:{}`. Other sections still run.
 - Partial failures (one paper account, docker down, ...) -> `ok:true` with a joined `error`; per-account `ok`/`error`.
@@ -34,6 +34,7 @@ written atomically (tmp + `os.replace`, fsync, 0644; dir 0755). Leftover `.tmp` 
 | paper | Alpaca: the `export_paper_fills.py` env file list + any `/opt/stacks/*/.env` with its key aliases (deduped by key id, label = stack dir). OANDA: `/opt/stacks/oanda-bridge/.env` | GET only, 10 s timeout, no retries, no redirects, no proxy. Alpaca `/v2/account`, `/v2/positions`, `/v2/account/activities/FILL?date=<today ET>`, `/v2/orders?status=open` on `paper-api.alpaca.markets` only. OANDA `summary`, `openTrades`, `pendingOrders`, `transactions/idrange` (last 20) on `api-fxpractice.oanda.com` only |
 | projects | `.git` presence in `/opt/scripts/tba`, `/opt/stacks/*`, `/root/{dendrix-ai,hermes-ai-router,rakazo,trading-bull-ai}` | `git -c core.fsmonitor=false -c safe.directory=* --no-optional-locks` + `status --porcelain` / `rev-parse --abbrev-ref HEAD` / `rev-parse --short=12 HEAD` / `log -1 --format=%ct%x00%s` / `rev-list --left-right --count @{u}...HEAD`, 5 s each, errors -> null |
 | vault | `/opt/stacks/tba-brain/**/*.md`: first 4 KB of each (skips dotdirs, symlinks, files > 300 KB, paths containing secret/credential/token/password/.env); 400 newest | none |
+| narrow | Bull Pilot `/opt/stacks/bull-pilot/data/shadow-v2/long_narrow_gap_orb_r2_v2.sqlite3` (SQLite WAL), opened `file:...?mode=ro&immutable=0` + `PRAGMA query_only` only while the writer's `-wal`/`-shm` exist (a ro open would otherwise create them); else, or if locked, db + `-wal` are copied into a private temp dir and the copy is read. Output: `schema` (table -> columns), `lane_state` (latest heartbeat), `counts` (total/today/last_7d by ET `session_date`), `latest_by_symbol` (latest signal per symbol: gap_pct, opening_range_atr, rvol, `trigger` = opening-range high, entry, `stop`, guardrail, exit, R), `recent` (30 newest signals+blocked, newest first), `as_of`, `source`, `stale` (as_of > 1 weekday behind today ET). Missing db / not sqlite / unexpected schema / locked and copy failed -> `ok:false` + `data.reason`. No quantity/$ P&L exported. The NARROW/WIDE StateMachine state is not persisted in this db (`per_symbol_narrow_wide_in_source:false`) | none |
 | logs | tail 40 of the 15 newest `/opt/logs/tba/*.log` (symlinks leaving the dir refused); each line <= 300 chars | `docker logs --tail 40 <name>` for containers named `bull-desk*`, `tba*`, `velez*`, `narrow-range*`, `oanda*` |
 
 Refusals: OANDA -> `{"ok":false,"error":"not practice"}` unless `OANDA_BASE_URL` host is exactly
@@ -61,7 +62,7 @@ fixed paper/practice host constants, never to the URL from the env file.
 |---|---|---|
 | `bull-observe-fast` | health, scanner, logs | 2 min |
 | `bull-observe-paper` | paper | 5 min |
-| `bull-observe-slow` | projects, vault | 15 min |
+| `bull-observe-slow` | projects, vault, narrow | 15 min |
 
 Install (Hermes, after review):
 

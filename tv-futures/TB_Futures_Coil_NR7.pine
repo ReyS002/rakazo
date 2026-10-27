@@ -1,0 +1,150 @@
+//@version=6
+// TB Futures Coil NR7 — Bull Desk / TickerBull futures-coil alert source.
+//
+// Purpose: ONE indicator on ONE 15-minute chart watches six micro futures via request.security.
+// On a CONFIRMED (closed) chart bar, every symbol whose bar shows a "coil + NR7" sends one
+// webhook to the Bull Desk tv-futures receiver, which re-validates and forwards a fixed-schema
+// message to the TickerBull bot. This script never trades.
+//
+// Rules (same definition as Bull Pilot / TickerBull), computed per symbol in its own context:
+//   spread     = |SMA(close,20) - SMA(close,200)| / close
+//   narrowAll  = highest(spread, 10) < 0.004          (all of the last 10 spreads under 0.4 %)
+//   atrPct     = SMA(trueRange, 14) / close            (PLAIN average of true range, not Wilder RMA)
+//   atrFalling = atrPct < atrPct[10]
+//   nr7        = (high - low) <= lowest(high - low, 7) (narrowest of the last 7, ties count)
+//   fire_i     = chart bar confirmed and sendAlerts and key set and chart on 15m
+//                and symbol i's setup and symbol i has a bar at this chart bar's time
+//
+// Alert setup (ONE chart, ONE alert for all six symbols):
+//   1. Open any 15-minute chart (recommended CME_MINI:MES1!, 15m) and add this indicator.
+//      Settings -> Inputs -> "Webhook key": paste the shared key. Never share or publish this
+//      chart/layout while the key is set. The table (top right) lists the six symbols.
+//   2. Alerts (clock icon) -> Create alert.
+//      Condition: "TB Futures Coil NR7" -> "Any alert() function call".
+//      Notifications: tick "Webhook URL": https://desk.72.62.169.3.nip.io/tv-futures/alert
+//      Message: leave as is ({{}} placeholders are unused; alert() supplies the JSON body).
+//      Trigger frequency is irrelevant for alert() calls: the script itself only fires on
+//      confirmed bars with alert.freq_once_per_bar_close.
+//      Expiration: open-ended (or the longest your plan allows).
+//   3. Done. TradingView allows several alert() calls in one bar: if more than one symbol fires
+//      on the same bar close, each one is its own webhook with its own JSON body.
+//   See PINE_CHECKLIST.md.
+
+indicator("TB Futures Coil NR7", shorttitle = "TB Coil NR7", overlay = false)
+
+// ── inputs ──
+spreadMax   = input.float(0.004, "Spread max (fraction)", minval = 0.0, step = 0.0005, group = "Rules")
+coilBars    = input.int(10, "Coil bars (spread lookback)", minval = 1, group = "Rules")
+atrLen      = input.int(14, "ATR length (SMA of TR)", minval = 1, group = "Rules")
+atrLookback = input.int(10, "ATR falling lookback", minval = 1, group = "Rules")
+nr7Len      = input.int(7, "NR lookback", minval = 2, group = "Rules")
+smaFast     = input.int(20, "SMA fast", minval = 1, group = "Rules")
+smaSlow     = input.int(200, "SMA slow", minval = 1, group = "Rules")
+
+sym1        = input.symbol("CME_MINI:MES1!", "Symbol 1", group = "Symbols")
+sym2        = input.symbol("CME_MINI:MNQ1!", "Symbol 2", group = "Symbols")
+sym3        = input.symbol("CBOT_MINI:MYM1!", "Symbol 3", group = "Symbols")
+sym4        = input.symbol("CME_MINI:M2K1!", "Symbol 4", group = "Symbols")
+sym5        = input.symbol("NYMEX:MCL1!", "Symbol 5", group = "Symbols")
+sym6        = input.symbol("COMEX:MGC1!", "Symbol 6", group = "Symbols")
+
+secret      = input.string("", "Webhook key", group = "Webhook", tooltip = "paste the shared key; never share the chart")
+sendAlerts  = input.bool(true, "Send webhook alerts", group = "Webhook")
+
+tfCheck     = timeframe.period == "15"
+armed       = sendAlerts and secret != "" and tfCheck
+
+// ── per-symbol logic (runs in the requested symbol's context; every ta.* call runs on every bar) ──
+evalSym() =>
+    smaF       = ta.sma(close, smaFast)
+    smaS       = ta.sma(close, smaSlow)
+    spread     = math.abs(smaF - smaS) / close
+    maxSpread  = ta.highest(spread, coilBars)
+    narrowAll  = maxSpread < spreadMax
+    atrPct     = ta.sma(ta.tr(true), atrLen) / close
+    atrPrev    = atrPct[atrLookback]
+    atrFalling = atrPct < atrPrev
+    rng        = high - low
+    nr7        = rng <= ta.lowest(rng, nr7Len)
+    dataOk     = not na(spread) and not na(maxSpread) and not na(atrPct) and not na(atrPrev) and not na(rng)
+    setupOk    = dataOk and narrowAll and atrFalling and nr7
+    [setupOk, close, spread, maxSpread, atrPct, atrPrev, rng, time, syminfo.ticker]
+
+[ok1, c1, sp1, mx1, ap1, pv1, rg1, bt1, tk1] = request.security(sym1, timeframe.period, evalSym(), lookahead = barmerge.lookahead_off)
+[ok2, c2, sp2, mx2, ap2, pv2, rg2, bt2, tk2] = request.security(sym2, timeframe.period, evalSym(), lookahead = barmerge.lookahead_off)
+[ok3, c3, sp3, mx3, ap3, pv3, rg3, bt3, tk3] = request.security(sym3, timeframe.period, evalSym(), lookahead = barmerge.lookahead_off)
+[ok4, c4, sp4, mx4, ap4, pv4, rg4, bt4, tk4] = request.security(sym4, timeframe.period, evalSym(), lookahead = barmerge.lookahead_off)
+[ok5, c5, sp5, mx5, ap5, pv5, rg5, bt5, tk5] = request.security(sym5, timeframe.period, evalSym(), lookahead = barmerge.lookahead_off)
+[ok6, c6, sp6, mx6, ap6, pv6, rg6, bt6, tk6] = request.security(sym6, timeframe.period, evalSym(), lookahead = barmerge.lookahead_off)
+
+// bt_i == time: the symbol really printed a bar at this chart bar (no stale carry-over from a gap).
+fireOk(bool ok, float c, int bt) =>
+    barstate.isconfirmed and armed and ok and not na(c) and bt == time
+
+fire1 = fireOk(ok1, c1, bt1)
+fire2 = fireOk(ok2, c2, bt2)
+fire3 = fireOk(ok3, c3, bt3)
+fire4 = fireOk(ok4, c4, bt4)
+fire5 = fireOk(ok5, c5, bt5)
+fire6 = fireOk(ok6, c6, bt6)
+
+// ── webhook JSON (fixed schema; numbers rounded to 6 decimals, never NaN) ──
+num(float x) =>
+    str.tostring(na(x) ? 0.0 : math.round(x, 6), "0.######")
+
+jsonEscape(string s) =>
+    str.replace_all(str.replace_all(s, "\\", "\\\\"), "\"", "\\\"")
+
+jsonFor(string key, string ticker, string tf, int bt, float px, float sp, float mx, float ap, float pv, float rg) =>
+    "{\"key\":\"" + jsonEscape(key) + "\"" +
+         ",\"v\":1" +
+         ",\"src\":\"tv-futures\"" +
+         ",\"symbol\":\"" + jsonEscape(ticker) + "\"" +
+         ",\"tf\":\"" + tf + "\"" +
+         ",\"bar_time\":" + str.tostring(bt, "0") +
+         ",\"close\":" + num(px) +
+         ",\"spread\":" + num(sp) +
+         ",\"max_spread10\":" + num(mx) +
+         ",\"atr_pct\":" + num(ap) +
+         ",\"atr_pct_10_ago\":" + num(pv) +
+         ",\"range\":" + num(rg) +
+         ",\"nr7\":true}"
+
+if fire1
+    alert(jsonFor(secret, tk1, timeframe.period, bt1, c1, sp1, mx1, ap1, pv1, rg1), alert.freq_once_per_bar_close)
+if fire2
+    alert(jsonFor(secret, tk2, timeframe.period, bt2, c2, sp2, mx2, ap2, pv2, rg2), alert.freq_once_per_bar_close)
+if fire3
+    alert(jsonFor(secret, tk3, timeframe.period, bt3, c3, sp3, mx3, ap3, pv3, rg3), alert.freq_once_per_bar_close)
+if fire4
+    alert(jsonFor(secret, tk4, timeframe.period, bt4, c4, sp4, mx4, ap4, pv4, rg4), alert.freq_once_per_bar_close)
+if fire5
+    alert(jsonFor(secret, tk5, timeframe.period, bt5, c5, sp5, mx5, ap5, pv5, rg5), alert.freq_once_per_bar_close)
+if fire6
+    alert(jsonFor(secret, tk6, timeframe.period, bt6, c6, sp6, mx6, ap6, pv6, rg6), alert.freq_once_per_bar_close)
+
+// ── visuals ──
+chartSpread = math.abs(ta.sma(close, smaFast) - ta.sma(close, smaSlow)) / close
+plot(chartSpread, "Spread (chart symbol)", color = color.new(color.orange, 0), linewidth = 2)
+hline(spreadMax, "Spread max", color = color.new(color.red, 0), linestyle = hline.style_dashed)
+
+rowCells(table t, int row, string tk, bool ok, float sp) =>
+    table.cell(t, 0, row, tk == "" ? "—" : tk, text_color = color.white, text_size = size.small)
+    table.cell(t, 1, row, ok ? "yes" : "no", text_color = ok ? color.lime : color.silver, text_size = size.small)
+    table.cell(t, 2, row, na(sp) ? "—" : str.tostring(sp * 100, "0.000") + " %", text_color = na(sp) ? color.silver : sp < spreadMax ? color.lime : color.white, text_size = size.small)
+
+var table info = table.new(position.top_right, 3, 8, bgcolor = color.new(color.black, 20), border_width = 1)
+if barstate.islast
+    table.cell(info, 0, 0, "symbol", text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 0, "coil+NR7", text_color = color.gray, text_size = size.small)
+    table.cell(info, 2, 0, "spread", text_color = color.gray, text_size = size.small)
+    rowCells(info, 1, tk1, ok1, sp1)
+    rowCells(info, 2, tk2, ok2, sp2)
+    rowCells(info, 3, tk3, ok3, sp3)
+    rowCells(info, 4, tk4, ok4, sp4)
+    rowCells(info, 5, tk5, ok5, sp5)
+    rowCells(info, 6, tk6, ok6, sp6)
+    table.cell(info, 0, 7, "Webhook", text_color = color.white, text_size = size.small)
+    statusText = not tfCheck ? "Set chart to 15m" : armed ? "armed" : "off"
+    table.cell(info, 1, 7, statusText, text_color = color.white, bgcolor = armed ? color.new(color.green, 30) : color.new(color.red, 20), text_size = size.small)
+    table.cell(info, 2, 7, "", text_size = size.small)

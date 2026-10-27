@@ -111,10 +111,98 @@ def make_box(root, oanda_base="https://api-fxpractice.oanda.com", alpaca_base="h
     w("/opt/stacks/tba-brain/my-password-notes.md", "# pw\n")
     w("/opt/stacks/tba-brain/big.md", "# big\n" + "x" * (310 * 1024))
     w("/opt/stacks/tba-brain/readme.txt", "not markdown\n")
+    make_narrow_db(os.path.join(root, NARROW_DB.lstrip("/")))
     for repo in ("/opt/scripts/tba", "/opt/stacks/bull-desk", "/root/rakazo"):
         os.makedirs(os.path.join(root, repo.lstrip("/"), ".git"), exist_ok=True)
     os.makedirs(os.path.join(root, "opt/stacks/not-a-repo"), exist_ok=True)
     return root
+
+
+# ── fake Bull Pilot narrow-gap lane db (schema copied from bot/shadow/narrow_gap_long_v2.py) ──
+
+NARROW_DB = "/opt/stacks/bull-pilot/data/shadow-v2/long_narrow_gap_orb_r2_v2.sqlite3"
+NARROW_SCHEMA = (
+    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    """CREATE TABLE signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        setup_id TEXT NOT NULL, symbol TEXT NOT NULL, session_date TEXT NOT NULL,
+        detected_at TEXT NOT NULL, breakout_time TEXT NOT NULL, entry_time TEXT NOT NULL,
+        raw_entry REAL NOT NULL, opening_high REAL NOT NULL, opening_low REAL NOT NULL,
+        gap_pct REAL NOT NULL, opening_range_atr REAL NOT NULL, relative_volume REAL NOT NULL,
+        atr14 REAL NOT NULL, sma20_5m REAL, atr14_5m REAL, extension_atr REAL,
+        extension_side TEXT, guardrail_status TEXT NOT NULL, guardrail_reason TEXT,
+        stop_price REAL NOT NULL, quantity INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open', exit_time TEXT, exit_reason TEXT, raw_exit REAL,
+        normal_net_pnl REAL, normal_net_r REAL, harsh_net_pnl REAL, harsh_net_r REAL,
+        UNIQUE(setup_id, symbol, session_date))""",
+    """CREATE TABLE blocked (
+        setup_id TEXT NOT NULL, symbol TEXT NOT NULL, session_date TEXT NOT NULL,
+        entry_time TEXT NOT NULL, raw_entry REAL NOT NULL, extension_atr REAL,
+        reason TEXT NOT NULL, UNIQUE(setup_id, symbol, session_date))""",
+    """CREATE TABLE heartbeats (
+        generated_at TEXT PRIMARY KEY, session_date TEXT NOT NULL, state TEXT NOT NULL,
+        market_regime TEXT, eligible_symbols INTEGER NOT NULL DEFAULT 0,
+        new_signals INTEGER NOT NULL DEFAULT 0, new_blocked INTEGER NOT NULL DEFAULT 0,
+        total_signals INTEGER NOT NULL DEFAULT 0, total_closed INTEGER NOT NULL DEFAULT 0,
+        error TEXT)""",
+)
+SETUP = "opening_gap_narrow_orb_r2"
+
+
+def narrow_signal(symbol, session_date, hhmm="09:41", status="open", reason=None, **kw):
+    row = {"setup_id": SETUP, "symbol": symbol, "session_date": session_date,
+           "detected_at": f"{session_date}T{int(hhmm[:2]) + 4:02d}:{hhmm[3:]}:30.123456+00:00",
+           "breakout_time": f"{session_date}T09:40:00-04:00", "entry_time": f"{session_date}T{hhmm}:00-04:00",
+           "raw_entry": 101.5, "opening_high": 101.2, "opening_low": 100.4, "gap_pct": 1.8,
+           "opening_range_atr": 0.15, "relative_volume": 1.7, "atr14": 2.5, "sma20_5m": 100.0, "atr14_5m": 0.6,
+           "extension_atr": 2.4, "extension_side": "above", "guardrail_status": "caution",
+           "guardrail_reason": reason, "stop_price": 101.25, "quantity": 400, "status": status,
+           "normal_net_pnl": 12345.0}
+    row.update(kw)
+    return row
+
+
+def default_narrow_rows():
+    signals = [narrow_signal("AAPL", "2026-10-20", status="closed", exit_time="2026-10-20T15:55:00-04:00",
+                             exit_reason="eod", raw_exit=103.0, normal_net_r=1.4, harsh_net_r=1.2),
+               narrow_signal("AAPL", "2026-10-26", reason=f"note {LOG_TOKEN}"),
+               narrow_signal("MSFT", "2026-10-23", hhmm="09:45", guardrail_status="ok"),
+               narrow_signal("NVDA", "2026-10-01")]
+    blocked = [{"setup_id": SETUP, "symbol": "TSLA", "session_date": "2026-10-26",
+                "entry_time": "2026-10-26T09:50:00-04:00", "raw_entry": 250.0, "extension_atr": 3.4,
+                "reason": f"three-finger block Bearer {BEARER_TOK}"}]
+    heartbeats = [{"generated_at": "2026-10-26T14:58:45.124343+00:00", "session_date": "2026-10-26",
+                   "state": "collecting", "market_regime": "no_market_filter", "eligible_symbols": 7,
+                   "new_signals": 1, "new_blocked": 1, "total_signals": 4, "total_closed": 1,
+                   "error": f"retry {URL_SECRET} chat {CHAT_ID}"},
+                  {"generated_at": "2026-10-23T20:00:00+00:00", "session_date": "2026-10-23",
+                   "state": "outside_collection_window", "market_regime": None}]
+    return signals, blocked, heartbeats
+
+
+def make_narrow_db(path, signals=None, blocked=None, heartbeats=None, schema=NARROW_SCHEMA):
+    """WAL-mode lane db like Bull Pilot's. Rows default to default_narrow_rows()."""
+    import sqlite3
+    d_sig, d_blk, d_hb = default_narrow_rows()
+    signals = d_sig if signals is None else signals
+    blocked = d_blk if blocked is None else blocked
+    heartbeats = d_hb if heartbeats is None else heartbeats
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL")
+    for stmt in schema:
+        con.execute(stmt)
+    tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "metadata" in tables:
+        con.execute("INSERT INTO metadata VALUES ('execution_mode','signal_only_no_broker'),"
+                    f"('manifest_sha256','{'ab' * 32}')")
+    for table, rows in (("signals", signals), ("blocked", blocked), ("heartbeats", heartbeats)):
+        for row in rows if table in tables else ():
+            cols = ",".join(row)
+            con.execute(f"INSERT INTO {table} ({cols}) VALUES ({','.join('?' * len(row))})", list(row.values()))
+    con.commit()
+    con.close()
+    return path
 
 
 # ── fake subprocess.run ────────────────────────────────────────────────────

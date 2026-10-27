@@ -10,7 +10,7 @@ import collect
 import deps as d
 import scrub
 
-NAMES = ["health", "scanner", "paper", "projects", "vault", "logs"]
+NAMES = ["health", "scanner", "paper", "projects", "vault", "logs", "narrow"]
 
 
 class Collect(unittest.TestCase):
@@ -39,6 +39,7 @@ class Collect(unittest.TestCase):
         self.assertIn("[REDACTED]", outs["vault.json"])
         self.assertIn("[REDACTED]", outs["projects.json"])
         self.assertIn("tradingbull@example.com", outs["logs.json"])
+        self.assertIn("[REDACTED]", outs["narrow.json"])
 
     def test_envelope_shape(self):
         self.run_all()

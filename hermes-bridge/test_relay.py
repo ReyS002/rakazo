@@ -840,7 +840,8 @@ class ObserveRouteTest(unittest.TestCase):
         self.assertEqual(self.raw_get("/observe/health")[0], 200)
         self.assertEqual(self.raw_get("/observe/health?x=../secret")[0], 200)
         self.assertEqual(relay.OBSERVE_FILES, {n: n + ".json" for n in
-                                               ("health", "scanner", "paper", "projects", "vault", "logs")})
+                                               ("health", "scanner", "paper", "projects", "vault", "logs",
+                                                "narrow")})
         for name in ("../secret", "secret", "Health", "", None, 5, "health/../health"):
             with self.subTest(name=name), self.assertRaises(relay.SnapshotMissing):
                 relay.read_snapshot(name, self.dir)

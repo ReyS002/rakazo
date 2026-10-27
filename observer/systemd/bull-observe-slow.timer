@@ -1,6 +1,6 @@
 # EXAMPLE ONLY - not installed.
 [Unit]
-Description=Bull Desk oversight collector every 15 min (projects, vault)
+Description=Bull Desk oversight collector every 15 min (projects, vault, narrow)
 
 [Timer]
 OnBootSec=3min

@@ -5,7 +5,7 @@ collect.py [--only health,scanner,...] [--out DIR] [--once]
 
 Read-only: fixed git/docker/systemctl/df argv shapes, GET-only HTTP to paper/practice hosts, file reads.
 Every snapshot is scrubbed, re-checked for leaks (dropped to ok:false if any rule still matches),
-capped at 200 KB and written atomically (tmp + os.replace, 0644). One lock per section prevents overlap.
+capped at 200 KB (narrow: 150 KB) and written atomically (tmp + os.replace, 0644). One lock per section prevents overlap.
 """
 
 import argparse
@@ -21,14 +21,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import deps as d  # noqa: E402
 import scrub  # noqa: E402
-from sections import health, iso, logs, paper, projects, scanner, vault  # noqa: E402
+from sections import health, iso, logs, narrow, paper, projects, scanner, vault  # noqa: E402
 
 DEFAULT_OUT = "/opt/stacks/bull-desk/hermes-bridge-run/observe"
 SECTIONS = {"health": health.collect, "scanner": scanner.collect, "paper": paper.collect,
-            "projects": projects.collect, "vault": vault.collect, "logs": logs.collect}
+            "projects": projects.collect, "vault": vault.collect, "logs": logs.collect, "narrow": narrow.collect}
 BUDGET_S = 60.0
 HARD_STOP_S = 75
 MAX_BYTES = 200 * 1024
+SECTION_MAX_BYTES = {"narrow": 150 * 1024}
 ERROR_MAX = 200
 
 
@@ -52,18 +53,18 @@ def encode(env):
     return (json.dumps(env, ensure_ascii=False, separators=(",", ":"), sort_keys=False) + "\n").encode("utf-8")
 
 
-def fit(env):
-    """Halve the longest list until the snapshot fits MAX_BYTES; give up -> ok:false."""
+def fit(env, max_bytes=MAX_BYTES):
+    """Halve the longest list until the snapshot fits max_bytes; give up -> ok:false."""
     raw = encode(env)
     for _ in range(64):
-        if len(raw) <= MAX_BYTES:
+        if len(raw) <= max_bytes:
             return raw
         lst, n = _largest_list(env["data"])
         if not lst or n <= 1:
             break
         del lst[max(1, n // 2):]
         raw = encode(env)
-    if len(raw) <= MAX_BYTES:
+    if len(raw) <= max_bytes:
         return raw
     return encode({"name": env["name"], "generated_at": env["generated_at"], "ok": False,
                    "error": "snapshot too large", "data": {}})
@@ -87,7 +88,7 @@ def build(name, fn, deps):
     if leaks:
         env = {"name": name, "generated_at": generated_at, "ok": False,
                "error": "scrub check failed: " + ",".join(leaks), "data": {}}
-    return fit(env)
+    return fit(env, SECTION_MAX_BYTES.get(name, MAX_BYTES))
 
 
 def write_atomic(out_dir, name, raw):
@@ -116,7 +117,7 @@ def write_atomic(out_dir, name, raw):
 
 
 def clean_stale_tmp(out_dir, max_age_s=600):
-    """Remove temp files a killed run may have left (relay only serves the six fixed names anyway)."""
+    """Remove temp files a killed run may have left (relay only serves the fixed names anyway)."""
     now = time.time()
     for n in os.listdir(out_dir):
         if n.startswith(".") and n.endswith(".tmp"):
