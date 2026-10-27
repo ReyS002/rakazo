@@ -10,7 +10,7 @@
 | 3 | MYM  | `CBOT_MINI:MYM1!`  | `MYM1!`                | MYM |
 | 4 | M2K  | `CME_MINI:M2K1!`   | `M2K1!`                | M2K |
 | 5 | MCL  | `NYMEX:MCL1!`      | `MCL1!`                | MCL |
-| 6 | MGC  | `COMEX:MGC1!`      | `MGC1!`                | MGC |
+| 6 | MGC  | `COMEX_MINI:MGC1!`      | `MGC1!`                | MGC |
 
 The chart timeframe must be `15` (receiver allowlist `TV_TIMEFRAMES`, default `15`; anything else returns 422).
 On any other timeframe the script fires nothing and the table shows a red **Set chart to 15m** cell.

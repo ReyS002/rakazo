@@ -46,7 +46,7 @@ sym2        = input.symbol("CME_MINI:MNQ1!", "Symbol 2", group = "Symbols")
 sym3        = input.symbol("CBOT_MINI:MYM1!", "Symbol 3", group = "Symbols")
 sym4        = input.symbol("CME_MINI:M2K1!", "Symbol 4", group = "Symbols")
 sym5        = input.symbol("NYMEX:MCL1!", "Symbol 5", group = "Symbols")
-sym6        = input.symbol("COMEX:MGC1!", "Symbol 6", group = "Symbols")
+sym6        = input.symbol("COMEX_MINI:MGC1!", "Symbol 6", group = "Symbols")
 
 secret      = input.string("", "Webhook key", group = "Webhook", tooltip = "paste the shared key; never share the chart")
 sendAlerts  = input.bool(true, "Send webhook alerts", group = "Webhook")
