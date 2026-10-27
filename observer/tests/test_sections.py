@@ -72,6 +72,31 @@ class Sections(unittest.TestCase):
         self.assertEqual(cron["stock-alerts"], 60)
         self.assertIsNone(cron["options-alerts"])
 
+    def test_scanner_cron_sources_and_retired(self):
+        fakes.write(self.box.root, "/opt/logs/tba/fires-export.log", "", mtime=fakes.NOW - 86400 * 14)
+        fakes.write(self.box.root, "/opt/logs/tba/narrow-gap-shadow-export.log", "x\n", mtime=fakes.NOW - 86400)
+        rows = {r["name"]: r for r in scanner.collect(self.deps)["scanner_cron"]}
+        self.assertEqual(list(rows), list(scanner.SCANNER_LOGS))
+        # fires-export: age of the fires feed (NOW-30), not the 14-day-old empty log
+        self.assertEqual(rows["fires-export"], {"name": "fires-export", "source": "output_file_mtime",
+                                                "last_run_age_s": 30})
+        self.assertEqual(rows["narrow-gap-shadow-export"],
+                         {"name": "narrow-gap-shadow-export", "source": "log_mtime", "last_run_age_s": 86400,
+                          "retired": True, "note": "retired; replaced by narrow-gap-v2-shadow-export"})
+        # everything else unchanged apart from the added source field
+        self.assertEqual(rows["stock-alerts"], {"name": "stock-alerts", "source": "log_mtime", "last_run_age_s": 60})
+        self.assertEqual(rows["options-alerts"], {"name": "options-alerts", "source": "log_mtime",
+                                                  "last_run_age_s": None})
+        retired = [n for n, r in rows.items() if r.get("retired")]
+        self.assertEqual(retired, ["narrow-gap-shadow-export"])
+
+    def test_scanner_cron_missing_output_file(self):
+        os.remove(os.path.join(self.box.root, "opt/stacks/ops-status/scanner-fires-latest.jsonl"))
+        fakes.write(self.box.root, "/opt/logs/tba/fires-export.log", "", mtime=fakes.NOW)
+        rows = {r["name"]: r for r in scanner.collect(self.deps)["scanner_cron"]}
+        self.assertEqual(rows["fires-export"], {"name": "fires-export", "source": "output_file_mtime",
+                                                "last_run_age_s": None, "note": "output file missing"})
+
     def test_scanner_caps_to_50(self):
         path = os.path.join(self.box.root, "opt/stacks/ops-status/scanner-fires-latest.jsonl")
         with open(path, "w") as f:

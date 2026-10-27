@@ -15,6 +15,9 @@ BAD = re.compile(r"[^A-Za-z0-9._:+/ -]")  # tba-ro-status clean()
 SCANNER_LOGS = ("stock-alerts", "forex-alerts", "crypto-alerts", "options-alerts", "nrs-stock-export",
                 "nrs-forex-export", "nrs-crypto-export", "narrow-gap-shadow-export", "narrow-gap-v2-shadow-export",
                 "fires-export", "grokbot-push")
+# jobs whose log stays empty: freshness comes from the file they write instead (lstat only)
+OUTPUT_FILES = {"fires-export": FIRES_FILE}
+RETIRED = {"narrow-gap-shadow-export": "retired; replaced by narrow-gap-v2-shadow-export"}
 STATUS_RE = re.compile(r"^(\S+)\s+configured=(yes|no)\s+last_success=(\S+)\s+consec_fail=(\d+)"
                        r"\s+sent_today=(\d+)\s+retries=(\d+)\s+dead=(\d+)\s*$")
 BOT_RE = re.compile(r"[A-Z0-9_]{1,24}")
@@ -118,13 +121,22 @@ def parse_push_status(text):
 
 
 def scanner_cron(reader, now):
+    """One row per SCANNER_LOGS name. Retired jobs stay in the output (flagged) but must not count as stale."""
     rows = []
     for name in SCANNER_LOGS:
-        path = f"{LOG_DIR}/{name}.log"
+        out_file = OUTPUT_FILES.get(name)
+        path, source = (out_file, "output_file_mtime") if out_file else (f"{LOG_DIR}/{name}.log", "log_mtime")
+        row = {"name": name, "source": source}
         try:
-            rows.append({"name": name, "last_run_age_s": age(now, reader.lstat(path).st_mtime)})
+            row["last_run_age_s"] = age(now, reader.lstat(path).st_mtime)
         except OSError:
-            rows.append({"name": name, "last_run_age_s": None})
+            row["last_run_age_s"] = None
+            if out_file:
+                row["note"] = "output file missing"
+        if name in RETIRED:
+            row["retired"] = True
+            row["note"] = RETIRED[name]
+        rows.append(row)
     return rows
 
 
