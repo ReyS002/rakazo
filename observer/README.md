@@ -1,10 +1,10 @@
 # observer: oversight feed collector
 
-Trusted, host-side, read-only. Writes seven sanitized JSON snapshots for the relay
+Trusted, host-side, read-only. Writes eleven sanitized JSON snapshots for the relay
 (`GET` with bearer key; mounted read-only at `/run/bridge/observe/`). Spec: `observe-spec.md` (oversight feed v1).
 
 ```sh
-python3 -I collect.py [--only health,scanner,paper,projects,vault,logs,narrow] [--out DIR] [--once]
+python3 -I collect.py [--only health,scanner,paper,projects,vault,logs,narrow,nrs,journals,phasec,robinhood] [--out DIR] [--once]
 # default out: /opt/stacks/bull-desk/hermes-bridge-run/observe
 python3 -m unittest discover -s /opt/stacks/bull-desk/observer/tests
 ```
@@ -13,10 +13,11 @@ python3 -m unittest discover -s /opt/stacks/bull-desk/observer/tests
 
 ## Output
 
-`<name>.json` for `health scanner paper projects vault logs narrow` only. Each file is
-`{"name","generated_at","ok","error","data"}`, max 200 KB (`narrow`: 150 KB) (longest lists are halved until it fits),
+`<name>.json` for `health scanner paper projects vault logs narrow nrs journals phasec robinhood` only. Each file is
+`{"name","generated_at","ok","error","data"}`, max 200 KB (`narrow`, `nrs`, `journals`, `phasec`, `robinhood`: 150 KB) (longest lists are halved until it fits),
 written atomically (tmp + `os.replace`, fsync, 0644; dir 0755). Leftover `.tmp` files older than 10 min are removed.
-`.<name>.lock` files (0600) sit next to the snapshots; the relay only serves the seven fixed names (`narrow` added to `OBSERVE_NAMES` in hermes-bridge/relay.py).
+`.<name>.lock` files (0600) sit next to the snapshots; the relay only serves the eleven fixed names (`OBSERVE_NAMES` in hermes-bridge/relay.py).
+`collect.run` passes each section a `read_prev(name)` that reads the previous `<name>.json` (O_NOFOLLOW, <= 1 MB) for diffs.
 
 - A section that raises -> `ok:false`, short scrubbed `error`, `data:{}`. Other sections still run.
 - Partial failures (one paper account, docker down, ...) -> `ok:true` with a joined `error`; per-account `ok`/`error`.
@@ -35,6 +36,10 @@ written atomically (tmp + `os.replace`, fsync, 0644; dir 0755). Leftover `.tmp` 
 | projects | `.git` presence in `/opt/scripts/tba`, `/opt/stacks/*`, `/root/{dendrix-ai,hermes-ai-router,rakazo,trading-bull-ai}` | `git -c core.fsmonitor=false -c safe.directory=* --no-optional-locks` + `status --porcelain` / `rev-parse --abbrev-ref HEAD` / `rev-parse --short=12 HEAD` / `log -1 --format=%ct%x00%s` / `rev-list --left-right --count @{u}...HEAD`, 5 s each, errors -> null |
 | vault | `/opt/stacks/tba-brain/**/*.md`: first 4 KB of each (skips dotdirs, symlinks, files > 300 KB, paths containing secret/credential/token/password/.env); 400 newest | none |
 | narrow | Bull Pilot `/opt/stacks/bull-pilot/data/shadow-v2/long_narrow_gap_orb_r2_v2.sqlite3` (SQLite WAL), opened `file:...?mode=ro&immutable=0` + `PRAGMA query_only` only while the writer's `-wal`/`-shm` exist (a ro open would otherwise create them); else, or if locked, db + `-wal` are copied into a private temp dir and the copy is read. Output: `schema` (table -> columns), `lane_state` (latest heartbeat), `counts` (total/today/last_7d by ET `session_date`), `latest_by_symbol` (latest signal per symbol: gap_pct, opening_range_atr, rvol, `trigger` = opening-range high, entry, `stop`, guardrail, exit, R), `recent` (30 newest signals+blocked, newest first), `as_of`, `source`, `stale` (as_of > 1 weekday behind today ET). Missing db / not sqlite / unexpected schema / locked and copy failed -> `ok:false` + `data.reason`. No quantity/$ P&L exported. The NARROW/WIDE StateMachine state is not persisted in this db (`per_symbol_narrow_wide_in_source:false`) | none |
+| nrs | `/opt/stacks/ops-status/nrs-{stock,forex,crypto}-latest.json` (symlink followed only to a regular file in the same dir; the `nrs-*-export` jobs rewrite it every 15 min; schema 1.0 `nrs_<market>_redacted`), <= 4 MB each. Per market: `generated_at` (`ts_utc`), `as_of`, `age_s`, `file_mtime`, `watchlist_scan_date`, `trading_mode`, `export_error`, `counts`, `heartbeats` (last_success_at, detail), `watchlist` + `recent_triggers` (newest first) with every scalar field the export has (symbol, scores, NR7, ATR%, velez location, reasons, direction, rvol, breakout level, trigger time ...), <= 60 each; keys with url/chart/link/href/account/host, URL values and nested objects dropped; `_24h` keys spelled `_24_hours` (scrubber). `new_since_prev` = watchlist symbols / triggers (symbol, triggered_at, direction) not in the previous nrs.json (null on first run or when that market was not ok). `stale` per market: > 26 h old on a weekday (ET). A missing/malformed market -> that market `ok:false` + `reason`; all three -> section ok:false | none |
+| journals | `/opt/arena/state/exports/paper-fills-<YYYYMMDD>.json` (schema 2.0) and `*-decisions-<YYYYMMDD>.json` (`unchained-decisions` today) for today and the previous weekday (ET; no holiday calendar), <= 16 MB each. Per bot (keyed by the export's `label`: Unchained, Bull Pilot, Velez Trading, Swing, BullMatrix): fills (time, symbol, side, qty, price, fill_type, position_after), stop orders (type, qty, stop/limit/trail, status, tif, submitted/filled/cancelled), open positions, <= 150 rows each with true counts. Decisions: summary counters, every non-`passed` row then the newest `passed` rows up to 150 (time, symbol, setup, timeframe, side, decision, reason, entry, stop, qty, vol_ratio, location), closed trades. Dropped: `bars_2m`, `bars_2m_meta`, account keys/`account`, order/client/parent ids. `missing` lists absent files; `stale` = previous weekday's paper-fills missing, or today's missing after 16:30 ET on a weekday. No Velez decision journal is exported to that dir today (only unchained); any `<bot>-decisions-*.json` with the same shape is picked up | none |
+| phasec | TB-VSL-009: `/opt/stacks/ops-status/bullpilot-closed-trades-latest.json` (Bull Pilot reconciled closed paper trades), `/opt/stacks/bull-pilot/bot/reports/evaluation/universe_a1_watchlist_equity_buckets_v1.yaml` (A1 watchlist_all 25 = 13 mega + 12 mid_smaller), newest `paper-fills-*.json` (coverage cross-check: bull-pilot `fill_history_count` == export `fill_count`). Rule text: Bull Pen "TB-VSL-009 Phase C weekday digest" routine in `/root/grok-bot-instructions/bull-pen-strategies.md` (the Lab `TB-VSL-009*.md` files are not on this box; `found.lab_md` lists any that appear). Counts complete closes (exit time+price+pnl), setup `elephant_bar`, entry date ET >= 2026-09-22, symbol in A1 25, SPCX excluded (fail-closed), timeframe daily when the export states one (`timeframe_unverified_n` otherwise). Output: n, net_usd, profit_factor, exp_r, max_dd_usd (trade-PnL path), max_dd_pct (null: no equity base), mega/mid_smaller buckets, days_elapsed, gate (n>=50 OR 90 days from 2026-09-22 -> 2026-12-21), alerts_crossed (10/25/40), fail_triggers (net<=0 at n>=30; DD>8 % = not evaluable; PF<1 at n>=40), excluded tallies, last 60 closes, last_updated, stale (> 26 h on a weekday). TB-VSL-014: **ok:false** — no count md on the box and the source account is ambiguous (fab4 is allowlisted on the Bull Pilot swing lane, Bull Pen notes put Fab4 Phase C' closes on Velez Trading, which has no reconciled closed-trade export); `rule_known` carries setup, entry cut-off and the mega 13 from `tb_vsl_014_candidate01_manifest.json`. No numbers are produced for it | none |
+| robinhood | nothing on disk (never `/etc/hermes-robinhood-bridge.env`, OAuth store or tokens) | `GET http://127.0.0.1:28188/health` only, no headers, 5 s (`deps.LocalGet`: method must be GET, port+path must be in `LOCAL_ROUTES = {28188: {"/health"}}`, no query, no redirects/proxy; everything else is refused before a request). The bridge (`/root/hermes-ai-router/src/hermes-os/robinhood/bridge.ts`) exposes positions/cash/orders only as bearer-key `POST /v1/tools/<tool>` calls, so the section is always **ok:false** with `reason` + bridge status (reachable, http_status, connected, authenticated, authorization_pending, last_error). `positions`, `cash`, `buying_power`, `open_orders_count` stay null; `account_label` is always `robinhood`. A non-bridge answer on 28188 (shape check) -> ok:false "without the bridge's health shape" |
 | logs | tail 40 of the 15 newest `/opt/logs/tba/*.log` (symlinks leaving the dir refused); each line <= 300 chars | `docker logs --tail 40 <name>` for containers named `bull-desk*`, `tba*`, `velez*`, `narrow-range*`, `oanda*` |
 
 Refusals: OANDA -> `{"ok":false,"error":"not practice"}` unless `OANDA_BASE_URL` host is exactly
@@ -45,7 +50,7 @@ fixed paper/practice host constants, never to the URL from the env file.
 ## Safety
 
 - `deps.check_argv` allows only the exact argv shapes above (no shell, container/unit names regex-checked);
-  `deps.HttpGet` only does `GET` to the two hosts over https. Sections never touch subprocess/urllib/open directly.
+  `deps.HttpGet` only does `GET` to the two hosts over https; `deps.LocalGet` only does `GET` to `127.0.0.1` port+path pairs in `LOCAL_ROUTES` (no credentials sent). Sections never touch subprocess/urllib/open directly.
 - `scrub.py` runs on every string (values and keys) before writing: token-like runs, Bearer/Authorization,
   `*KEY*/*TOKEN*/*SECRET*/*PASSWORD*/... = value`, URLs with `?`/`/webhooks/`/`key=`/`token=`/`secret=`/userinfo,
   PEM private keys, Alpaca key ids, 9+ digit runs -> `[NUM]`. Text is scrubbed before it is truncated. After scrubbing,
@@ -62,7 +67,12 @@ fixed paper/practice host constants, never to the URL from the env file.
 |---|---|---|
 | `bull-observe-fast` | health, scanner, logs | 2 min |
 | `bull-observe-paper` | paper | 5 min |
-| `bull-observe-slow` | projects, vault, narrow | 15 min |
+| `bull-observe-slow` | projects, vault, narrow, nrs, journals, phasec, robinhood | 15 min |
+
+nrs/journals stay out of the 5-min paper unit: their sources change every 15 min (nrs exports) or once a day
+(paper-fills ~16:23 ET, closed-trades ~16:28 ET, decisions 04:10 ET), so the 15-min slow timer already has them by
+~16:45 ET, and the paper unit is the only one with outside network. The slow unit allows AF_INET to localhost only
+(`IPAddressDeny=any` + `IPAddressAllow=localhost`) for robinhood's loopback GET.
 
 Install (Hermes, after review):
 

@@ -181,6 +181,56 @@ class HttpGet:
             raise HttpError("bad JSON") from None
 
 
+# ── loopback GET-only HTTP (watch-only local bridges) ───────────────────────
+
+LOCAL_HOST = "127.0.0.1"
+# port -> exact paths that may be fetched. Robinhood bridge: only the unauthenticated status route; every
+# /v1/tools*, /oauth/* (start/callback), order/arm/authorize route is refused before any request.
+LOCAL_ROUTES = {28188: frozenset({"/health"})}
+MAX_LOCAL_BODY = 256 * 1024
+
+
+class LocalGet:
+    """local_get(port, path, timeout=5) -> (status, parsed JSON or None). GET only, 127.0.0.1 only,
+    allowlisted port+path only, no query string, no headers (never sends a credential), no redirects/proxy."""
+
+    METHOD = "GET"
+
+    def __init__(self, deadline, opener=None):
+        self.deadline = deadline
+        self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+    @staticmethod
+    def check(method, port, path):
+        if method != "GET":
+            raise HttpError("method not allowed")
+        if not isinstance(port, int) or isinstance(port, bool) or port not in LOCAL_ROUTES:
+            raise HttpError("port not allowed")
+        if not isinstance(path, str) or path not in LOCAL_ROUTES[port]:
+            raise HttpError("path not allowed")
+
+    def __call__(self, port, path, timeout=5.0):
+        self.check(self.METHOD, port, path)
+        req = urllib.request.Request(f"http://{LOCAL_HOST}:{port}{path}", method=self.METHOD)
+        self.check(req.get_method(), port, urllib.parse.urlsplit(req.full_url).path)
+        try:
+            with self.opener.open(req, timeout=self.deadline.clip(timeout)) as resp:
+                status, raw = getattr(resp, "status", 200), resp.read(MAX_LOCAL_BODY + 1)
+        except urllib.error.HTTPError as e:
+            try:
+                status, raw = e.code, e.read(MAX_LOCAL_BODY + 1)
+            finally:
+                e.close()
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise HttpError(type(e).__name__) from None
+        if len(raw) > MAX_LOCAL_BODY:
+            raise HttpError("response too large")
+        try:
+            return status, json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return status, None
+
+
 # ── rooted read-only filesystem ─────────────────────────────────────────────
 
 
@@ -284,8 +334,11 @@ class Deps:
     deadline: Deadline
     now: Callable = time.time
     push_status: Callable = default_push_status
+    local_get: Callable = None
+    read_prev: Callable = lambda name: None  # noqa: E731  (collect.run binds it to the output dir)
 
 
 def real_deps(budget_s=60.0):
     deadline = Deadline(budget_s)
-    return Deps(runner=Runner(deadline), http_get=HttpGet(deadline), reader=Reader("/"), deadline=deadline)
+    return Deps(runner=Runner(deadline), http_get=HttpGet(deadline), reader=Reader("/"), deadline=deadline,
+                local_get=LocalGet(deadline))

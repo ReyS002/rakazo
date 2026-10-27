@@ -10,7 +10,8 @@ import collect
 import deps as d
 import scrub
 
-NAMES = ["health", "scanner", "paper", "projects", "vault", "logs", "narrow"]
+NAMES = ["health", "scanner", "paper", "projects", "vault", "logs", "narrow", "nrs", "journals", "phasec", "robinhood"]
+EXPECTED = {n: "ok" for n in NAMES} | {"robinhood": "error"}  # robinhood: positions need the bridge key -> ok:false
 
 
 class Collect(unittest.TestCase):
@@ -25,7 +26,7 @@ class Collect(unittest.TestCase):
 
     def test_no_planted_secret_survives_anywhere(self):
         res = self.run_all()
-        self.assertEqual(res, {n: "ok" for n in NAMES})
+        self.assertEqual(res, EXPECTED)
         outs = self.box.outputs()
         self.assertEqual(sorted(outs), sorted(n + ".json" for n in NAMES))
         for fname, text in outs.items():
@@ -40,6 +41,8 @@ class Collect(unittest.TestCase):
         self.assertIn("[REDACTED]", outs["projects.json"])
         self.assertIn("tradingbull@example.com", outs["logs.json"])
         self.assertIn("[REDACTED]", outs["narrow.json"])
+        for n in ("nrs", "journals", "robinhood"):
+            self.assertIn("[REDACTED]", outs[n + ".json"], n)
 
     def test_envelope_shape(self):
         self.run_all()

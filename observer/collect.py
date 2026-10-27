@@ -5,10 +5,11 @@ collect.py [--only health,scanner,...] [--out DIR] [--once]
 
 Read-only: fixed git/docker/systemctl/df argv shapes, GET-only HTTP to paper/practice hosts, file reads.
 Every snapshot is scrubbed, re-checked for leaks (dropped to ok:false if any rule still matches),
-capped at 200 KB (narrow: 150 KB) and written atomically (tmp + os.replace, 0644). One lock per section prevents overlap.
+capped at 200 KB (narrow/nrs/journals/phasec/robinhood: 150 KB) and written atomically (tmp + os.replace, 0644). One lock per section prevents overlap.
 """
 
 import argparse
+import dataclasses
 import fcntl
 import json
 import os
@@ -21,15 +22,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import deps as d  # noqa: E402
 import scrub  # noqa: E402
-from sections import health, iso, logs, narrow, paper, projects, scanner, vault  # noqa: E402
+from sections import (health, iso, journals, logs, narrow, nrs, paper, phasec, projects,  # noqa: E402
+                      robinhood, scanner, vault)
 
 DEFAULT_OUT = "/opt/stacks/bull-desk/hermes-bridge-run/observe"
 SECTIONS = {"health": health.collect, "scanner": scanner.collect, "paper": paper.collect,
-            "projects": projects.collect, "vault": vault.collect, "logs": logs.collect, "narrow": narrow.collect}
+            "projects": projects.collect, "vault": vault.collect, "logs": logs.collect, "narrow": narrow.collect,
+            "nrs": nrs.collect, "journals": journals.collect, "phasec": phasec.collect, "robinhood": robinhood.collect}
 BUDGET_S = 60.0
 HARD_STOP_S = 75
 MAX_BYTES = 200 * 1024
-SECTION_MAX_BYTES = {"narrow": 150 * 1024}
+SECTION_MAX_BYTES = {n: 150 * 1024 for n in ("narrow", "nrs", "journals", "phasec", "robinhood")}
+PREV_MAX_BYTES = 1 << 20
 ERROR_MAX = 200
 
 
@@ -140,6 +144,20 @@ def lock_section(out_dir, name):
     return fd
 
 
+def read_prev_snapshot(out_dir, name):
+    """Parsed previous <name>.json envelope from out_dir (for diffs such as nrs.new_since_prev), else None."""
+    try:
+        fd = os.open(os.path.join(out_dir, name + ".json"), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read(PREV_MAX_BYTES + 1)
+        if len(raw) > PREV_MAX_BYTES:
+            return None
+        env = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return env if isinstance(env, dict) and env.get("name") == name else None
+
+
 def prepare_out(out_dir):
     os.makedirs(out_dir, mode=0o755, exist_ok=True)
     os.chmod(out_dir, 0o755)
@@ -149,6 +167,7 @@ def run(names, out_dir, deps, log=print):
     """Collect names into out_dir. Returns {name: "ok"|"error"|"busy"|"skipped"}."""
     prepare_out(out_dir)
     clean_stale_tmp(out_dir)
+    deps = dataclasses.replace(deps, read_prev=lambda n: read_prev_snapshot(out_dir, n))
     result = {}
     for name in names:
         if deps.deadline.expired():

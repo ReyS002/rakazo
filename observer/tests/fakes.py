@@ -112,6 +112,9 @@ def make_box(root, oanda_base="https://api-fxpractice.oanda.com", alpaca_base="h
     w("/opt/stacks/tba-brain/big.md", "# big\n" + "x" * (310 * 1024))
     w("/opt/stacks/tba-brain/readme.txt", "not markdown\n")
     make_narrow_db(os.path.join(root, NARROW_DB.lstrip("/")))
+    make_nrs(root)
+    make_journals(root)
+    make_phasec(root)
     for repo in ("/opt/scripts/tba", "/opt/stacks/bull-desk", "/root/rakazo"):
         os.makedirs(os.path.join(root, repo.lstrip("/"), ".git"), exist_ok=True)
     os.makedirs(os.path.join(root, "opt/stacks/not-a-repo"), exist_ok=True)
@@ -203,6 +206,200 @@ def make_narrow_db(path, signals=None, blocked=None, heartbeats=None, schema=NAR
     con.commit()
     con.close()
     return path
+
+
+# ── fake nrs exports (shape copied from /opt/stacks/ops-status/nrs-stock-latest.json, schema 1.0) ──
+
+OPS = "/opt/stacks/ops-status"
+
+
+def nrs_doc(market, ts="2026-10-26T14:45:01Z", watch=("AAPL", "MSFT"), triggers=(("AAPL", "2026-10-26T14:30:00+00:00"),)):
+    return {
+        "schema_version": "1.0", "export_type": f"nrs_{market}_redacted", "ts_utc": ts,
+        "host": "srv1668095.hstgr.cloud", "lane_id": f"narrow_range_scanner_{market}", "trading_mode": "WATCH_ONLY",
+        "authority_level": 0, "source_db_basename": "scanner.db", "error": None,
+        "watchlist_scan_date": "2026-10-26",
+        "watchlist": [{"symbol": s, "composite_score": 60.8, "weekly_trend": "up", "is_nr7": True, "atr_pct": 2.1,
+                       "last_price": 101.5, "velez_location": "Near 20 SMA", "chart_url": URL_SECRET,
+                       "tv_link": "https://www.tradingview.com/chart/?symbol=X",
+                       "reasons_short": ["NR7", f"note {LOG_TOKEN}", {"nested": 1}],
+                       "account_id": "PA3FAKE99999"} for s in watch],
+        "recent_triggers": [{"symbol": s, "triggered_at": t, "direction": "long", "rvol": 1.6,
+                             "detail": f"15m breakout chat {CHAT_ID}", "breakout_level": 100.2,
+                             "scan_date": "2026-10-26"} for s, t in triggers],
+        "heartbeats": {f"{market}-live-poller": {"process": "x", "last_success_at": "2026-10-26T14:44:13.648988+00:00",
+                                                 "detail": "ok"}},
+        "counts": {"watchlist": len(watch), "recent_triggers_confirmed_unsuppressed_24h": len(triggers)},
+        "redaction": "allowlisted_columns_only_no_secrets",
+    }
+
+
+def write_nrs(root, market, doc, stamp="2026-10-26T14:45:01Z", mtime=NOW - 900):
+    """Timestamped export + `-latest.json` symlink beside it, like the export jobs."""
+    target = write(root, f"{OPS}/nrs-{market}-{stamp}.json",
+                   doc if isinstance(doc, str) else json.dumps(doc), mtime=mtime)
+    link = os.path.join(root, OPS.lstrip("/"), f"nrs-{market}-latest.json")
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(target, link)
+    return target
+
+
+def make_nrs(root):
+    for m in ("stock", "forex", "crypto"):
+        write_nrs(root, m, nrs_doc(m))
+
+
+# ── fake journals (paper-fills schema 2.0, unchained-decisions schema 1.3) ──
+
+EXPORTS = "/opt/arena/state/exports"
+
+
+def paper_fills_doc(day="2026-10-23"):
+    bars = {"AMZN": [{"start_et": f"{day}T09:30:00-04:00", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 863902}] * 50}
+    return {
+        "schema_version": "2.0", "date": day, "generated_et": f"{day}T16:23:01-04:00",
+        "positions_as_of_et": f"{day}T16:23:01-04:00", "notes": ["x"], "missing_accounts": [],
+        "accounts": {
+            "PYPV": {"label": "Unchained", "env_stack": "unchained-mentor", "fill_count": 2,
+                     "fills": [{"symbol": "AMZN", "side": "buy", "qty": 99.0, "price": 249.9,
+                                "time_et": f"{day}T09:30:49-04:00",
+                                "order_id": "aad1f6d6-3773-4d14-bc48-7574092ec75a", "fill_type": "fill",
+                                "position_after": 0.0, "bar_2m_volume": 863902}] * 2,
+                     "stop_order_count": 1,
+                     "stop_orders": [{"symbol": "AMZN", "side": "buy", "type": "stop", "qty": "99",
+                                      "stop_price": "249.14", "status": "filled", "time_in_force": "gtc",
+                                      "order_id": "aad1f6d6-3773-4d14-bc48-7574092ec75a",
+                                      "client_order_id": "unchained-a89c1c72630c41e7a75f",
+                                      "parent_order_id": "e0f85b49-c9bd-448a-863e-b73134cac4f7",
+                                      "submitted_et": f"{day}T14:05:44-04:00", "filled_et": f"{day}T15:00:00-04:00"}],
+                     "bars_2m_meta": {"AMZN": {"feed": "sip"}}, "bars_2m": bars,
+                     "fill_history_complete": True, "fill_history_count": 57,
+                     "open_positions": [{"symbol": "QCOM", "side": "long", "qty": 32.0, "avg_entry_price": 176.6,
+                                         "unrealized_pl": 95.7, "current_price": 179.6,
+                                         "opened_at_et": f"{day}T09:31:36-04:00", "account_number": "PA3FAKE99999"}]},
+            "JI68": {"label": "Bull Pilot", "env_stack": "bull-pilot", "fill_count": 0, "fills": [],
+                     "stop_order_count": 0, "stop_orders": [], "bars_2m": {}, "fill_history_complete": True,
+                     "fill_history_count": 6, "open_positions": []},
+        },
+    }
+
+
+def decisions_doc(day="2026-10-23", passed=200):
+    rows = [{"time_et": f"{day}T10:{i % 60:02d}:05-04:00", "symbol": "SPY", "setup": "bear_180", "side": "sell",
+             "decision": "passed", "reason": "not_tradable_filtered", "client_order_id": f"unchained-{LOG_TOKEN}",
+             "order_id": None, "vol_ratio": 0.8} for i in range(passed)]
+    rows.insert(5, {"time_et": f"{day}T09:45:00-04:00", "symbol": "AMZN", "setup": "bear_180", "side": "sell",
+                    "decision": "taken", "reason": f"ok Bearer {BEARER_TOK}", "entry": 248.91, "stop": 249.14,
+                    "qty": 99, "order_id": "e0f85b49-c9bd-448a-863e-b73134cac4f7"})
+    return {"schema_version": "1.3", "export_type": "unchained_decisions", "date": day,
+            "generated_et": f"{day}T23:59:00-04:00", "final": True, "account": "PYPV",
+            "bot": {"stack": "/opt/stacks/unchained-mentor"},
+            "summary": {"alerts_in": passed + 1, "taken": 1, "passed": passed,
+                        "passed_by_reason": {"not_tradable_filtered": passed},
+                        "by_setup": {"bear_180": {"passed": passed, "taken": 1}}, "bot_daystats": None},
+            "decisions": rows,
+            "closed_trades": [{"symbol": "AMZN", "side": "short", "qty": 99.0, "setup": "bear_180",
+                               "entry_time_et": f"{day}T09:45:00-04:00", "entry_price": 248.91,
+                               "exit_time_et": f"{day}T10:30:00-04:00", "exit_price": 249.9,
+                               "exit_reason": "stop_hit", "pnl_usd": -98.01, "r_multiple": -4.3,
+                               "entry_client_order_id": "unchained-a89c1c72630c41e7a75f"}],
+            "errors": []}
+
+
+def make_journals(root):
+    write(root, f"{EXPORTS}/paper-fills-20261023.json", json.dumps(paper_fills_doc()), mtime=NOW - 3 * 86400)
+    write(root, f"{EXPORTS}/unchained-decisions-20261023.json", json.dumps(decisions_doc()), mtime=NOW - 2 * 86400)
+    write(root, f"{EXPORTS}/stop_slippage_20261023.json", "{}")
+
+
+# ── fake Phase C inputs ────────────────────────────────────────────────────
+
+EVAL = "/opt/stacks/bull-pilot/bot/reports/evaluation"
+A1 = ["SPY", "QQQ", "NVDA", "MSFT", "AAPL", "AMD", "TSLA", "AMZN", "META", "GOOGL", "MU", "AVGO", "INTC", "TSM",
+      "QCOM", "ARM", "SMCI", "HIMS", "HOOD", "OSCR", "BABA", "UBER", "NFLX", "MARA", "SPCX"]
+MEGA = ["SPY", "QQQ", "NVDA", "MSFT", "AAPL", "AMD", "TSLA", "AMZN", "META", "GOOGL", "AVGO", "TSM", "NFLX"]
+MID = [s for s in A1 if s not in MEGA]
+
+
+def buckets_yaml(a1=A1, mega=MEGA, mid=MID):
+    lst = lambda xs, ind: "".join(f"{ind}- {s}\n" for s in xs)  # noqa: E731
+    return ("# TB-VSL-009 Amendment A1\nschema_version: \"1.0\"\nscope:\n  excluded_from_tv_42:\n    - ES1!\n"
+            "primary_sleeve_equity:\n" + lst(a1, "  ") + f"  count: {len(a1)}\n"
+            "cap_cut_rule:\n  rule_id: x\n  mega:\n" + lst(mega, "    ") + f"    count: {len(mega)}\n"
+            "  mid_smaller:\n" + lst(mid, "    ") + f"    count: {len(mid)}\n"
+            "liquidity_policy:\n  location_gates: must_remain_on\n")
+
+
+def ctrade(symbol, entry, exit_, pnl, r, setup="elephant_bar", **kw):
+    t = {"trade_id": f"JI68-{symbol}-x", "account": "JI68", "symbol": symbol, "side": "long", "qty": 1.0,
+         "setup": setup, "entry_time_et": entry, "entry_price": 100.0, "exit_time_et": exit_,
+         "exit_price": None if pnl is None else 100.0 + pnl, "exit_reason": "stop_hit", "pnl_usd": pnl, "r_multiple": r,
+         "entry_client_order_id": f"bp-{LOG_TOKEN}"}
+    t.update(kw)
+    return t
+
+
+def default_ctrades():
+    return [ctrade("NVDA", "2026-10-01T10:00:00-04:00", "2026-10-05T15:00:00-04:00", 30.0, 1.5),
+            ctrade("MU", "2026-10-06T10:00:00-04:00", "2026-10-08T15:00:00-04:00", -10.0, -1.0),
+            ctrade("SPCX", "2026-10-06T10:00:00-04:00", "2026-10-07T15:00:00-04:00", 5.0, 0.5),
+            ctrade("AAPL", "2026-09-21T23:00:00-04:00", "2026-09-25T15:00:00-04:00", 9.0, 0.9),
+            ctrade("PLTR", "2026-10-01T10:00:00-04:00", "2026-10-01T11:00:00-04:00", -1.4, -1.0),
+            ctrade("SPY", "2026-10-16T09:32:00-04:00", "2026-10-16T09:33:00-04:00", -0.2, -0.03, setup="unchained"),
+            ctrade("AMD", "2026-10-20T10:00:00-04:00", None, None, None),
+            ctrade("TSLA", "2026-10-21T10:00:00-04:00", "2026-10-22T10:00:00-04:00", 4.0, 0.4, timeframe="5Min")]
+
+
+def closed_doc(trades=None, fill_count=6, since="2026-09-28T11:28:08.844089+00:00",
+               generated="2026-10-26T12:56:03+00:00"):
+    return {"schema_version": "1.0", "export_type": "bullpilot_closed_trades", "generated_utc": generated,
+            "account": "JI68", "since": since, "fill_count": fill_count,
+            "trades": default_ctrades() if trades is None else trades}
+
+
+def write_closed(root, doc, stamp="20261026T125603Z"):
+    target = write(root, f"{OPS}/bullpilot-closed-trades-{stamp}.json",
+                   doc if isinstance(doc, str) else json.dumps(doc), mtime=NOW - 7200)
+    link = os.path.join(root, OPS.lstrip("/"), "bullpilot-closed-trades-latest.json")
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(os.path.basename(target), link)  # relative, like the real export
+    return target
+
+
+def make_phasec(root):
+    write(root, f"{EVAL}/universe_a1_watchlist_equity_buckets_v1.yaml", buckets_yaml())
+    write(root, f"{EVAL}/tb_vsl_014_candidate01_manifest.json",
+          json.dumps({"task_id": "TB-VSL-014", "confirmation_universe": MEGA, "confirmation_universe_count": 13}))
+    write(root, "/root/grok-bot-instructions/bull-pen-strategies.md", "# routines\n")
+    write_closed(root, closed_doc())
+
+
+# ── fake loopback bridge (robinhood /health) ────────────────────────────────
+
+class FakeLocalOpener:
+    """Stands in for the loopback opener; records (method, url, headers, data). mode picks the answer."""
+
+    def __init__(self, mode="health503"):
+        self.calls = []
+        self.mode = mode
+
+    def open(self, req, timeout=None):
+        url = req.full_url
+        self.calls.append((req.get_method(), url, dict(req.header_items()), req.data))
+        if self.mode == "refused":
+            raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+        if self.mode == "foreign":
+            return _Resp(b"<html>hello</html>")
+        body = {"ok": self.mode == "health200", "connected": self.mode == "health200",
+                "authenticated": self.mode == "health200", "authorization_pending": False,
+                "last_error": f"oauth refresh failed token={LOG_TOKEN} chat {CHAT_ID}",
+                "positions": [{"symbol": "AAPL", "account_number": "5RH123456789"}]}
+        raw = json.dumps(body).encode()
+        if self.mode == "health503":
+            raise urllib.error.HTTPError(url, 503, "unavailable", {}, io.BytesIO(raw))
+        return _Resp(raw)
 
 
 # ── fake subprocess.run ────────────────────────────────────────────────────
@@ -356,12 +553,14 @@ class Box:
         self.out = os.path.join(self.tmp.name, "observe")
         self.run = FakeRun()
         self.opener = FakeOpener()
+        self.local_opener = FakeLocalOpener()
         self.deadline = d.Deadline(60)
         self.push_text = PUSH_STATUS_TEXT
 
     def deps(self, **over):
         kw = dict(runner=d.Runner(self.deadline, run=self.run),
                   http_get=d.HttpGet(self.deadline, opener=self.opener),
+                  local_get=d.LocalGet(self.deadline, opener=self.local_opener),
                   reader=d.Reader(self.root), deadline=self.deadline, now=lambda: NOW,
                   push_status=lambda: self.push_text)
         kw.update(over)

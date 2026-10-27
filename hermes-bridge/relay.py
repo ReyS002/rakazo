@@ -55,7 +55,8 @@ RESULT_ID_RE = re.compile(r"bd-[0-9]{8}-[0-9]{6}-[0-9a-f]{4}")
 RESULT_FILE_RE = re.compile(r"(bd-[0-9]{8}-[0-9]{6}-[0-9a-f]{4})\.json")
 KILL_OBSERVE_FILE = "/run/bridge/KILL_OBSERVE"
 OBSERVE_DIR = os.environ.get("OBSERVE_DIR", "/run/bridge/observe")
-OBSERVE_NAMES = ("health", "scanner", "paper", "projects", "vault", "logs", "narrow")
+OBSERVE_NAMES = ("health", "scanner", "paper", "projects", "vault", "logs", "narrow", "nrs", "journals", "phasec",
+                 "robinhood")
 OBSERVE_FILES = {name: name + ".json" for name in OBSERVE_NAMES}  # the only paths ever opened
 OBSERVE_ENVELOPE = ("name", "generated_at", "ok", "error", "data")
 OBSERVE_PER_MINUTE = 60
