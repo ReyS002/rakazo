@@ -5,7 +5,7 @@ collect.py [--only health,scanner,...] [--out DIR] [--once]
 
 Read-only: fixed git/docker/systemctl/df argv shapes, GET-only HTTP to paper/practice hosts, file reads.
 Every snapshot is scrubbed, re-checked for leaks (dropped to ok:false if any rule still matches),
-capped at 200 KB (narrow/nrs/journals/phasec/robinhood: 150 KB) and written atomically (tmp + os.replace, 0644). One lock per section prevents overlap.
+capped at 200 KB (narrow/nrs/phasec/robinhood: 150 KB, journals: 8 MB) and written atomically (tmp + os.replace, 0644). One lock per section prevents overlap.
 """
 
 import argparse
@@ -32,8 +32,10 @@ SECTIONS = {"health": health.collect, "scanner": scanner.collect, "paper": paper
 BUDGET_S = 60.0
 HARD_STOP_S = 75
 MAX_BYTES = 200 * 1024
-SECTION_MAX_BYTES = {n: 150 * 1024 for n in ("narrow", "nrs", "journals", "phasec", "robinhood")}
-PREV_MAX_BYTES = 1 << 20
+SECTION_MAX_BYTES = {n: 150 * 1024 for n in ("narrow", "nrs", "phasec", "robinhood")}
+# Full trading days for 4 bots (real: ~3.9 MB for two days); the relay slices it, never serves it whole.
+SECTION_MAX_BYTES["journals"] = 8 << 20
+PREV_MAX_BYTES = max(1 << 20, *SECTION_MAX_BYTES.values())
 ERROR_MAX = 200
 
 

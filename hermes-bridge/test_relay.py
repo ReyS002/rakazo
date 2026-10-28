@@ -709,14 +709,15 @@ class ObserveRouteTest(unittest.TestCase):
         self.server = None
         self.start(self.env)
 
-    def start(self, env, observe_limiter=None):
+    def start(self, env, observe_limiter=None, journals_limiter=None):
         if self.server:
             self.server.shutdown()
             self.server.server_close()
         unlimited = lambda: relay.RateLimiter(windows=[(60, 1000)])  # noqa: E731
         self.server = relay.make_server(
             relay.load_config(env), host="127.0.0.1", port=0, limiter=unlimited(), task_limiter=unlimited(),
-            results_limiter=unlimited(), observe_limiter=observe_limiter or unlimited())
+            results_limiter=unlimited(), observe_limiter=observe_limiter or unlimited(),
+            journals_limiter=journals_limiter or unlimited())
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
@@ -1052,6 +1053,434 @@ class ObserveRouteTest(unittest.TestCase):
         self.assertIn("status=404 bytes=0 from=- route=observe\n", out)
         self.assertIn("status=403 bytes=0 from=- route=observe", out)
         self.assertIn("status=401 bytes=0 from=- route=observe", out)
+
+
+J_TODAY, J_PREV = "2026-10-27", "2026-10-26"
+
+
+def _stamp(base, seconds):
+    return (base + datetime.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def journals_data():
+    """Collector-shaped journals data: Unchained 3000 decisions today (08:00Z = 04:00 ET onward, every 19 s)."""
+    base = datetime.datetime(2026, 10, 27, 8, 0, tzinfo=datetime.timezone.utc)
+    dec = [{"time": _stamp(base, 19 * i), "symbol": f"U{i}", "setup": "bear_180", "timeframe": "2m", "side": "sell",
+            "decision": "passed" if i % 50 else "taken", "reason": "not_tradable_filtered", "entry": None,
+            "stop": None, "qty": None, "vol_ratio": 0.8, "location": None} for i in range(3000)]
+    dec[7].update(order_id="LEAK-ORDER", account="LEAK-ACCT", client_order_id="LEAK-COID", nested={"x": "LEAK-N"})
+    velez = [{"time": _stamp(base, 120 * i), "symbol": "VDEC", "decision": "passed", "reason": "x"}
+             for i in range(300)]
+    fills = [{"time": _stamp(base, 5400 + 60 * i), "symbol": "UFILL", "side": "buy", "qty": float(i), "price": 1.0,
+              "fill_type": "fill", "position_after": 0.0} for i in range(40)]
+    lists = lambda **kw: {k: {"total_rows": v[0], "kept_rows": v[1], "truncated": v[0] > v[1]}  # noqa: E731
+                          for k, v in kw.items()}
+    paper = {"ok": True, "reason": None, "bots": {
+        "Unchained": {"code": "PYPV", "fill_count": 40, "fills": fills,
+                      "stop_orders": [{"symbol": "USTOP", "stop_price": 1.0 + i} for i in range(7)],
+                      "open_positions": [{"symbol": "UPOS"}],
+                      "lists": lists(fills=(40, 40), stop_orders=(7, 7), open_positions=(1, 1))},
+        "Velez Trading": {"code": "TYWQ", "fills": [], "stop_orders": [{"symbol": "VSTOP"}] * 3,
+                          "open_positions": [], "lists": lists(fills=(0, 0), stop_orders=(3, 3), open_positions=(0, 0))},
+        "Bull Pilot": {"code": "JI68", "fills": [], "stop_orders": [], "open_positions": []},
+        "Mystery": {"code": None, "fills": [{"symbol": "MFILL"}], "stop_orders": [], "open_positions": []}}}
+    today = {"date": J_TODAY, "missing": [], "paper_fills": paper, "decisions": {
+        "unchained": {"ok": True, "label": "Unchained", "code": "PYPV", "decisions": dec,
+                      "closed_trades": [{"symbol": "UCLOSED", "pnl_usd": -1.0}],
+                      "lists": lists(decisions=(3200, 3000), closed_trades=(1, 1))},
+        "velez-trading": {"ok": True, "label": "Velez Trading", "code": "TYWQ", "decisions": velez,
+                          "closed_trades": [], "lists": lists(decisions=(300, 300), closed_trades=(0, 0))}}}
+    prev_base = datetime.datetime(2026, 10, 26, 13, 30, tzinfo=datetime.timezone.utc)
+    prev = {"date": J_PREV, "paper_fills": None, "missing": ["/opt/arena/state/exports/paper-fills-20261026.json"],
+            "decisions": {"unchained": {"ok": True, "label": "Unchained", "code": "PYPV", "closed_trades": [],
+                                        "decisions": [{"time": _stamp(prev_base, 60 * i), "symbol": "PREV",
+                                                       "decision": "passed"} for i in range(100)]},
+                          "broken": {"ok": False, "reason": "source is not valid JSON"}}}
+    return {"catalog": {"ignored": "relay recomputes"}, "today_et": J_TODAY, "stale": False,
+            "days": {"today": today, "prev_weekday": prev}}
+
+
+class JournalsRouteTest(unittest.TestCase):
+    setUp = ObserveRouteTest.setUp
+    start = ObserveRouteTest.start
+    tearDown = ObserveRouteTest.tearDown
+    call = RelayTest.call
+    raw_get = ObserveRouteTest.raw_get
+    put = ObserveRouteTest.put
+
+    def put_journals(self, data=None, **over):
+        self.put("journals", envelope("journals", data=journals_data() if data is None else data, **over))
+
+    def q(self, key=OBS_KEY, **params):
+        code, headers, body = self.call("/observe/journals" + ("?" + urllib.parse.urlencode(params) if params else ""),
+                                        "GET", key=key)
+        return code, headers, body
+
+    def ok(self, **params):
+        code, headers, body = self.q(**params)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertLessEqual(len(body), relay.JOURNALS_SLICE_MAX)
+        return json.loads(body)
+
+    def err(self, expect, **params):
+        code, headers, body = self.q(**params)
+        self.assertEqual(code, expect, body)
+        data = json.loads(body)
+        self.assertEqual(data["ok"], False)
+        return data["error"]
+
+    def walk(self, **params):
+        rows, offset, calls = [], 0, 0
+        while offset is not None:
+            page = self.ok(offset=offset, **params)
+            self.assertEqual(page["offset"], offset)
+            self.assertEqual(page["returned"], len(page["rows"]))
+            rows += page["rows"]
+            offset = page["next_offset"]
+            calls += 1
+            self.assertLess(calls, 200)
+        return rows, page["total"]
+
+    def test_fixture_is_big(self):
+        self.put_journals()
+        size = os.path.getsize(os.path.join(self.dir, "journals.json"))
+        self.assertGreater(size, 400 * 1024)
+        self.assertLessEqual(size, relay.SNAPSHOT_MAX_BYTES["journals"])
+
+    def test_index(self):
+        self.put_journals()
+        code, headers, body = self.q()
+        self.assertEqual((code, headers["Cache-Control"]), (200, "no-store"))
+        self.assertLess(len(body), 20 * 1024)
+        data = json.loads(body)
+        self.assertEqual(set(data), {"ok", "name", "generated_at", "age_s", "stale", "error", "exports_stale",
+                                     "missing", "catalog", "usage"})
+        self.assertEqual((data["ok"], data["name"], data["stale"], data["exports_stale"]),
+                         (True, "journals", False, False))
+        self.assertEqual(data["missing"], ["/opt/arena/state/exports/paper-fills-20261026.json"])
+        for needle in ("offset", "limit", "before=HH:MM", "after=HH:MM", "status", "next_offset", "PYPV", "7E3U"):
+            self.assertIn(needle, data["usage"])
+        today = {b["label"]: b for b in data["catalog"]["today"]["bots"]}
+        self.assertEqual(data["catalog"]["today"]["date"], J_TODAY)
+        self.assertEqual(today["Unchained"], {
+            "label": "Unchained", "code": "PYPV", "fills": 40, "stop_orders": 7, "open_positions": 1,
+            "closed_trades": 1, "decisions": 3000, "truncated_at_source": ["decisions"],
+            "first_time_et": "2026-10-27T04:00:00-04:00", "last_time_et": "2026-10-27T19:49:41-04:00"})
+        self.assertEqual((today["Velez Trading"]["code"], today["Velez Trading"]["decisions"],
+                          today["Velez Trading"]["stop_orders"]), ("TYWQ", 300, 3))
+        self.assertEqual((today["Bull Pilot"]["decisions"], today["Bull Pilot"]["fills"]), (None, 0))
+        self.assertIsNone(today["Mystery"]["code"])
+        prev = data["catalog"]["prev_weekday"]
+        self.assertEqual(prev["date"], J_PREV)
+        self.assertEqual([(b["label"], b["fills"], b["decisions"]) for b in prev["bots"]], [("Unchained", None, 100)])
+        for leak in (b"LEAK", b'"rows"', b"U2999", b"ignored"):
+            self.assertNotIn(leak, body)
+        self.assertEqual(self.call("/observe/journals?", "GET", key=OBS_KEY)[0], 200)  # empty query = index
+
+    def test_index_bounded_with_many_bots(self):
+        data = journals_data()
+        bots = data["days"]["today"]["paper_fills"]["bots"]
+        for i in range(400):
+            bots[f"Extra Bot {i:03d}"] = {"code": None, "fills": [], "stop_orders": [], "open_positions": []}
+        self.put_journals(data)
+        code, _, body = self.q()
+        self.assertEqual(code, 200)
+        self.assertLessEqual(len(body), relay.JOURNALS_INDEX_MAX)
+        self.assertTrue(json.loads(body)["catalog_truncated"])
+
+    def test_index_of_failed_snapshot(self):
+        self.put("journals", envelope("journals", ok=False, error="no exports", data={}))
+        data = json.loads(self.q()[2])
+        self.assertEqual((data["ok"], data["error"], data["catalog"]), (False, "no exports", {}))
+        self.assertIn("no journal days", self.err(404, day="today", bot="PYPV", section="fills"))
+
+    def test_slice_shape_and_params(self):
+        self.put_journals()
+        page = self.ok(day="today", bot="PYPV", section="stop_orders")
+        self.assertEqual(set(page), {"ok", "name", "day", "day_key", "bot", "section", "filters", "total", "offset",
+                                     "limit", "returned", "next_offset", "truncated_at_source", "generated_at",
+                                     "age_s", "stale", "rows"})
+        self.assertEqual((page["name"], page["day"], page["day_key"], page["bot"], page["section"]),
+                         ("journals", J_TODAY, "today", {"label": "Unchained", "code": "PYPV"}, "stop_orders"))
+        self.assertEqual((page["total"], page["offset"], page["limit"], page["returned"], page["next_offset"],
+                          page["truncated_at_source"]), (7, 0, 200, 7, None, False))
+        self.assertEqual([r["stop_price"] for r in page["rows"]], [1.0 + i for i in range(7)])
+        # day by key or date; bot by code or label, any case
+        for day in ("today", J_TODAY):
+            for bot in ("PYPV", "pypv", "Unchained", "UNCHAINED", "unchained"):
+                with self.subTest(day=day, bot=bot):
+                    self.assertEqual(self.ok(day=day, bot=bot, section="stop_orders")["rows"], page["rows"])
+        self.assertEqual(self.ok(day="today", bot="velez trading",
+                                 section="stop_orders")["bot"], {"label": "Velez Trading", "code": "TYWQ"})
+        for section, total in (("fills", 40), ("open_positions", 1), ("closed_trades", 1), ("decisions", 3000)):
+            with self.subTest(section=section):
+                self.assertEqual(self.ok(day="today", bot="PYPV", section=section)["total"], total)
+        prev = self.ok(day="prev_weekday", bot="PYPV", section="decisions", limit=500)
+        self.assertEqual((prev["day"], prev["total"], prev["returned"]), (J_PREV, 100, 100))
+        self.assertEqual(self.ok(day=J_PREV, bot="PYPV", section="decisions")["rows"], prev["rows"])
+        page = self.ok(day="today", bot="PYPV", section="fills", offset=5, limit=3)
+        self.assertEqual(([r["qty"] for r in page["rows"]], page["next_offset"]), ([5.0, 6.0, 7.0], 8))
+        page = self.ok(day="today", bot="PYPV", section="fills", offset=38, limit=3)
+        self.assertEqual(([r["qty"] for r in page["rows"]], page["next_offset"]), ([38.0, 39.0], None))
+        page = self.ok(day="today", bot="PYPV", section="fills", offset=40)
+        self.assertEqual((page["rows"], page["returned"], page["next_offset"]), ([], 0, None))
+        page = self.ok(day="today", bot="PYPV", section="fills", offset=9999999)
+        self.assertEqual((page["rows"], page["next_offset"]), ([], None))
+        self.assertEqual(self.ok(day="today", bot="Bull Pilot", section="fills")["total"], 0)
+        self.assertEqual(self.ok(day="today", bot="Mystery", section="fills")["bot"], {"label": "Mystery", "code": None})
+
+    def test_bot_filter_only_that_bot(self):
+        self.put_journals()
+        own = {"PYPV": {"fills": "UFILL", "stop_orders": "USTOP", "open_positions": "UPOS",
+                        "closed_trades": "UCLOSED", "decisions": "U"},
+               "TYWQ": {"stop_orders": "VSTOP", "decisions": "VDEC"}, "Mystery": {"fills": "MFILL"}}
+        for bot, sections in own.items():
+            for section, prefix in sections.items():
+                with self.subTest(bot=bot, section=section):
+                    rows, total = self.walk(day="today", bot=bot, section=section, limit=500)
+                    self.assertEqual(len(rows), total)
+                    self.assertGreater(total, 0)
+                    self.assertTrue(all(r["symbol"].startswith(prefix) for r in rows))
+                    if prefix == "U":
+                        self.assertFalse(any(r["symbol"] == "VDEC" for r in rows))
+
+    def test_bad_params_400(self):
+        self.put_journals()
+        good = {"day": "today", "bot": "PYPV", "section": "decisions"}
+        cases = [
+            ({"x": "1"}, "unknown query parameter"), ({"Day": "today"}, "unknown query parameter"),
+            ({"day": "yesterday"}, "day must be"), ({"day": "2026-10-2"}, "day must be"), ({"day": ""}, "day must be"),
+            ({"bot": "PY/PV"}, "bot must be"), ({"bot": "x" * 41}, "bot must be"), ({"bot": ""}, "bot must be"),
+            ({"section": "Fills"}, "section must be"), ({"section": "../x"}, "section must be"),
+            ({"offset": "-1"}, "offset"), ({"offset": "abc"}, "offset"), ({"offset": "1.5"}, "offset"),
+            ({"offset": "12345678"}, "offset"), ({"offset": ""}, "offset"),
+            ({"limit": "0"}, "limit"), ({"limit": "501"}, "limit"), ({"limit": " 5"}, "limit"),
+            ({"before": "15:60"}, "before"), ({"before": "24:00"}, "before"), ({"before": "3:45"}, "before"),
+            ({"after": "15:45:00"}, "after"), ({"status": "taken"}, "status"), ({"status": "ALL"}, "status"),
+            ({"section": "fills", "before": "15:45"}, "only to section=decisions"),
+            ({"section": "stop_orders", "status": "all"}, "only to section=decisions"),
+        ]
+        for over, needle in cases:
+            with self.subTest(over=over):
+                self.assertIn(needle, self.err(400, **{**good, **over}))
+        for raw in ("day=today&day=today&bot=PYPV&section=fills", "day=today&bot=PYPV&section=fills&limit=1&limit=2"):
+            with self.subTest(raw=raw):
+                code, _, body = self.call("/observe/journals?" + raw, "GET", key=OBS_KEY)
+                self.assertEqual(code, 400)
+                self.assertIn("only once", json.loads(body)["error"])
+        code, _, body = self.call("/observe/journals?" + "&".join(f"p{i}=1" for i in range(20)), "GET", key=OBS_KEY)
+        self.assertEqual(code, 400)
+        code, _, body = self.call("/observe/journals?LEAKME=%3Cscript%3E", "GET", key=OBS_KEY)
+        self.assertEqual(code, 400)
+        self.assertNotIn(b"LEAKME", body)
+        self.assertNotIn(b"script", body)
+
+    def test_missing_values_404_list_valid(self):
+        self.put_journals()
+        msg = self.err(404, day="2026-10-20", bot="PYPV", section="fills")
+        self.assertIn("unknown day", msg)
+        for v in ("today", "prev_weekday", J_TODAY, J_PREV):
+            self.assertIn(v, msg)
+        self.assertIn("day is required", self.err(404, bot="PYPV", section="fills"))
+        msg = self.err(404, day="today", bot="Nobody", section="fills")
+        for v in ("unknown bot", "Unchained (PYPV)", "Velez Trading (TYWQ)", "Bull Pilot (JI68)", "Mystery"):
+            self.assertIn(v, msg)
+        self.assertIn("bot is required", self.err(404, day="today", section="fills"))
+        msg = self.err(404, day="today", bot="PYPV", section="bars_2m")
+        self.assertIn("unknown section", msg)
+        for v in relay.JOURNALS_SECTIONS:
+            self.assertIn(v, msg)
+        self.assertIn("section is required", self.err(404, day="today", bot="PYPV"))
+        # bot known for the day but that source is absent
+        self.assertIn("no decisions export", self.err(404, day="today", bot="JI68", section="decisions"))
+        self.assertIn("no paper-fills export", self.err(404, day="prev_weekday", bot="PYPV", section="fills"))
+        self.assertIn("unknown bot", self.err(404, day="prev_weekday", bot="broken", section="decisions"))
+
+    def test_pagination_walk_exact(self):
+        self.put_journals()
+        expected = [relay._out_row(r) for r in journals_data()["days"]["today"]["decisions"]["unchained"]["decisions"]]
+        for limit in (500, 200, 137, 1):
+            with self.subTest(limit=limit):
+                if limit == 1:  # a 3000-call walk is slow; walk the first 50 one by one
+                    rows = [self.ok(day="today", bot="PYPV", section="decisions", offset=i, limit=1)["rows"][0]
+                            for i in range(50)]
+                    self.assertEqual(rows, expected[:50])
+                    continue
+                rows, total = self.walk(day="today", bot="PYPV", section="decisions", limit=limit)
+                self.assertEqual(total, 3000)
+                self.assertEqual(rows, expected)  # same order, no gaps, no duplicates
+                self.assertEqual(len({r["symbol"] for r in rows}), 3000)
+        page = self.ok(day="today", bot="PYPV", section="decisions", limit=500)
+        self.assertTrue(page["truncated_at_source"])
+        self.assertLess(page["returned"], 500)  # 40 KB cap kicks in before 500 rows of this size
+        self.assertEqual(page["next_offset"], page["returned"])
+
+    def test_time_slicing(self):
+        self.put_journals()
+        all_rows = journals_data()["days"]["today"]["decisions"]["unchained"]["decisions"]
+
+        def et_hm(r):
+            t = relay._row_et(r)
+            return (t.hour, t.minute, t.second)
+
+        rows, total = self.walk(day="today", bot="PYPV", section="decisions", before="15:45", limit=500)
+        want = [relay._out_row(r) for r in all_rows if et_hm(r) < (15, 45, 0)]
+        self.assertEqual((rows, total), (want, len(want)))
+        self.assertEqual((rows[0]["time_et"], rows[-1]["time_et"][:5]), ("04:00:00", "15:44"))
+        self.assertEqual(rows[0]["time"], "2026-10-27T08:00:00Z")  # 04:00 ET, the start of the day
+        rows, _ = self.walk(day="today", bot="PYPV", section="decisions", after="15:45", limit=500)
+        self.assertEqual(len(rows) + total, 3000)  # after is inclusive, before exclusive: no overlap, no gap
+        self.assertGreaterEqual(et_hm(rows[0]), (15, 45, 0))
+        rows, n = self.walk(day="today", bot="PYPV", section="decisions", after="09:30", before="09:31")
+        self.assertEqual(n, 3)  # 09:30:17, :36, :55 (every 19 s from 04:00:00)
+        self.assertTrue(all(relay._row_et(r).strftime("%H:%M") == "09:30" for r in rows))
+        page = self.ok(day="today", bot="PYPV", section="decisions", status="not_passed", limit=500)
+        self.assertEqual((page["total"], {r["decision"] for r in page["rows"]}), (60, {"taken"}))
+        page = self.ok(day="today", bot="PYPV", section="decisions", status="passed", before="04:10", limit=500)
+        self.assertEqual({r["decision"] for r in page["rows"]}, {"passed"})
+        self.assertEqual(page["filters"], {"before": "04:10", "after": None, "status": "passed"})
+        self.assertEqual(self.ok(day="today", bot="PYPV", section="decisions", after="23:59")["total"], 0)
+
+    def test_utc_to_et_matches_zoneinfo(self):
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo("America/New_York")
+        except Exception:  # pragma: no cover - host without tzdata
+            self.skipTest("no tzdata")
+        start = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+        for hours in range(0, 3 * 366 * 24, 7):
+            when = start + datetime.timedelta(hours=hours, minutes=30)
+            self.assertEqual(relay.utc_to_et(when).utcoffset(), when.astimezone(tz).utcoffset(), when)
+        for stamp in ("2026-03-08T06:59:59Z", "2026-03-08T07:00:00Z", "2026-11-01T05:59:59Z", "2026-11-01T06:00:00Z"):
+            when = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+            self.assertEqual(relay.utc_to_et(when).utcoffset(), when.astimezone(tz).utcoffset(), stamp)
+
+    def test_response_size_cap(self):
+        data = journals_data()
+        fat = [{"time": _stamp(datetime.datetime(2026, 10, 27, 14, tzinfo=datetime.timezone.utc), i),
+                "symbol": f"F{i}", "decision": "passed", "reason": "w" * (3000 + 37 * i)} for i in range(120)]
+        data["days"]["today"]["decisions"]["unchained"]["decisions"] = fat
+        self.put_journals(data)
+        rows, offset = [], 0
+        while offset is not None:
+            code, _, body = self.q(day="today", bot="PYPV", section="decisions", offset=offset, limit=500)
+            self.assertEqual(code, 200)
+            self.assertLessEqual(len(body), relay.JOURNALS_SLICE_MAX)
+            page = json.loads(body)
+            self.assertGreaterEqual(page["returned"], 1)
+            self.assertLess(page["returned"], 120)
+            rows += page["rows"]
+            offset = page["next_offset"]
+        self.assertEqual(rows, [relay._out_row(r) for r in fat])  # whole rows only, nothing cut or lost
+        self.assertEqual(rows[0]["time_et"], "10:00:00")
+
+    def test_rows_scrubbed(self):
+        self.put_journals()
+        rows, _ = self.walk(day="today", bot="PYPV", section="decisions", limit=500)
+        text = json.dumps(rows)
+        for leak in ("LEAK", "order_id", "account", "nested"):
+            self.assertNotIn(leak, text)
+        self.assertEqual(rows[7]["symbol"], "U7")
+        self.assertEqual(relay._clean_row({"trade_id": 1, "id": 2, "ids": 3, "api_key": 4, "token": 5,
+                                           "account_number": 6, "keystone": 7, "stop_price": 8, "symbol": "S",
+                                           "x": [1], "position_after": 9}),
+                         {"keystone": 7, "stop_price": 8, "symbol": "S", "position_after": 9})
+
+    def test_truncated_at_source_detects_collector_halving(self):
+        data = journals_data()
+        dec = data["days"]["today"]["decisions"]["velez-trading"]
+        del dec["decisions"][150:]  # collect.fit() halved the list, meta still says 300
+        self.put_journals(data)
+        page = self.ok(day="today", bot="TYWQ", section="decisions")
+        self.assertEqual((page["total"], page["truncated_at_source"]), (150, True))
+        self.assertFalse(self.ok(day="today", bot="TYWQ", section="stop_orders")["truncated_at_source"])
+
+    def test_snapshot_size_limit_per_name(self):
+        self.put("vault", envelope("vault", data={"pad": "a" * (300 * 1024)}))
+        self.assertEqual(self.call("/observe/vault", "GET", key=OBS_KEY)[0], 502)
+        self.put_journals()
+        self.assertGreater(os.path.getsize(os.path.join(self.dir, "journals.json")), relay.MAX_SNAPSHOT_FILE)
+        self.assertEqual(self.ok(day="today", bot="PYPV", section="fills")["total"], 40)
+        base = len(json.dumps(envelope("journals", data={"x": ""})))
+        self.put("journals", envelope("journals", data={"x": "a" * (relay.SNAPSHOT_MAX_BYTES["journals"] - base + 1)}))
+        code, _, body = self.q()
+        self.assertEqual((code, json.loads(body)), (502, {"ok": False, "error": "bad snapshot"}))
+        self.assertEqual(self.q(day="today", bot="PYPV", section="fills")[0], 502)
+
+    def test_missing_snapshot(self):
+        self.assertEqual(json.loads(self.q()[2]), {"ok": False, "error": "no snapshot yet"})
+        self.assertEqual(self.q(day="today", bot="PYPV", section="fills")[0], 404)
+        self.assertEqual(self.q(x="1")[0], 400)  # params are validated before the file is opened
+
+    def test_other_names_unchanged(self):
+        self.put_journals()
+        self.put("health", envelope("health"))
+        code, _, body = self.call("/observe/health?day=today&bot=PYPV&section=fills&x=1", "GET", key=OBS_KEY)
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["data"], {"note": "health-payload"})
+        index = json.loads(self.call("/observe", "GET", key=OBS_KEY)[2])
+        self.assertIn({"name": "journals", "ok": True, "stale": False},
+                      [{k: s[k] for k in ("name", "ok", "stale")} for s in index["snapshots"]])
+        for path in ("/observe/journals/", "/observe/journals/today", "/observe/Journals", "/observe/journals.json"):
+            with self.subTest(path=path):
+                self.assertEqual(self.raw_get(path)[0], 404)
+
+    def test_auth_and_kill(self):
+        self.put_journals()
+        for key, status in ((KEY, 403), (TASK_KEY, 403), ("w" * 40, 403), (None, 401), (OBS_KEY2, 200)):
+            with self.subTest(key=(key or "")[:2]):
+                self.assertEqual(self.q(key=key)[0], status)
+                self.assertEqual(self.q(key=key, day="today", bot="PYPV", section="fills")[0], status)
+                self.assertEqual(self.q(key=key, x="1")[0], status if status != 200 else 400)
+        for kill in (self.kill_observe, self.kill):
+            with self.subTest(kill=os.path.basename(kill)):
+                open(kill, "w").close()
+                for params in ({}, {"day": "today", "bot": "PYPV", "section": "fills"}, {"x": "1"}):
+                    code, headers, _ = self.q(**params)
+                    self.assertEqual((code, headers["Cache-Control"]), (503, "no-store"))
+                os.remove(kill)
+        self.assertEqual(self.q(day="today", bot="PYPV", section="fills")[0], 200)
+        code, headers, _ = self.call("/observe/journals?day=today", "POST", {"x": 1}, key=OBS_KEY)
+        self.assertEqual((code, headers["Allow"]), (405, "GET"))
+
+    def test_rate_limits(self):
+        self.assertGreaterEqual(relay.JOURNALS_PER_MINUTE, 120)
+        self.assertEqual(relay.OBSERVE_PER_MINUTE, 60)
+        self.start(self.env, observe_limiter=relay.make_observe_limiter(),
+                   journals_limiter=relay.make_journals_limiter())
+        self.put_journals()
+        self.put("health", envelope("health"))
+        for i in range(relay.JOURNALS_PER_MINUTE):
+            code = (self.q() if i % 3 == 0 else self.q(day="today", bot="PYPV", section="stop_orders", limit=1))[0]
+            self.assertEqual(code, 200, i)
+        code, headers, _ = self.q(day="today", bot="PYPV", section="fills")
+        self.assertEqual((code, headers["Cache-Control"]), (429, "no-store"))
+        self.assertGreaterEqual(int(headers["Retry-After"]), 1)
+        self.assertEqual(self.q()[0], 429)
+        # The other observe names keep their own 60/min limiter, untouched by journals traffic.
+        for _ in range(relay.OBSERVE_PER_MINUTE):
+            self.assertEqual(self.call("/observe/health", "GET", key=OBS_KEY)[0], 200)
+        self.assertEqual(self.call("/observe", "GET", key=OBS_KEY)[0], 429)
+        now = [0.0]
+        limiter = relay.make_journals_limiter(clock=lambda: now[0])
+        for _ in range(120):
+            self.assertEqual(limiter.acquire(), 0)
+        self.assertEqual(limiter.acquire(), 60)
+
+    def test_logs_have_no_contents(self):
+        self.put_journals()
+        self.q()
+        self.q(day="today", bot="PYPV", section="decisions")
+        self.q(day="today", bot="Nobody-LEAKBOT", section="fills")
+        self.q(x="LEAKPARAM")
+        out = self.stdout.getvalue()
+        for needle in ("LEAK", "U7", "UFILL", OBS_KEY, "Nobody"):
+            self.assertNotIn(needle, out)
+        self.assertIn("status=200 bytes=0 from=- route=observe name=journals view=index\n", out)
+        self.assertIn("status=200 bytes=0 from=- route=observe name=journals view=slice section=decisions\n", out)
+        self.assertIn("status=404 bytes=0 from=- route=observe name=journals view=slice\n", out)
+        self.assertIn("status=400 bytes=0 from=- route=observe name=journals\n", out)
 
 
 class StartupTest(unittest.TestCase):

@@ -313,6 +313,56 @@ def make_journals(root):
     write(root, f"{EXPORTS}/stop_slippage_20261023.json", "{}")
 
 
+# ── fake bot decisions dbs (schema copied from velez-trading-bot/bot/journal_store.py) ──
+
+VELEZ_DB = "/opt/stacks/velez-trading-bot/data/trading_bull_desk.sqlite3"
+PILOT_DB = "/opt/stacks/bull-pilot/data/trading_bull_desk.sqlite3"
+SWING_DB = "/opt/stacks/velez-swing-bot/data/trading_bull_desk.sqlite3"
+DECISIONS_SCHEMA = (
+    """CREATE TABLE decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, alert_ref TEXT, status TEXT NOT NULL,
+        reason TEXT, symbol TEXT, side TEXT, play TEXT, qty INTEGER, order_type TEXT, entry_price REAL,
+        stop_price REAL, take_profit_price REAL, timeframe TEXT, location TEXT, max_dollar_risk REAL,
+        order_payload_json TEXT, broker_response_json TEXT, snapshot_json TEXT)""",
+    "CREATE INDEX idx_decisions_timestamp ON decisions(timestamp)",
+)
+# Planted in the three big JSON columns and alert_ref: must never reach any output.
+BLOB_SECRETS = ["PAYLOADfakeSecretKey123", "BROKERfakeAcctPA9Z", "SNAPSHOTfakeToken456", "ALERTREFfake789"]
+
+
+def decision_db_row(ts, status="rejected", symbol="AAPL", reason="below vwap", **kw):
+    row = {"timestamp": ts, "alert_ref": BLOB_SECRETS[3], "status": status, "reason": reason, "symbol": symbol,
+           "side": "buy", "play": "elephant_bar", "qty": 10, "order_type": "stop_limit", "entry_price": 230.5,
+           "stop_price": 229.9, "take_profit_price": 232.0, "timeframe": "2m", "location": "above 20ma",
+           "max_dollar_risk": 50.0,
+           "order_payload_json": json.dumps({"key": BLOB_SECRETS[0], "secret": ALPACA_SEC}),
+           "broker_response_json": json.dumps({"account_number": BLOB_SECRETS[1], "id": OANDA_ACCT}),
+           "snapshot_json": json.dumps({"token": BLOB_SECRETS[2], "auth": f"Bearer {BEARER_TOK}"})}
+    row.update(kw)
+    return row
+
+
+def make_decisions_db(root, path, rows=(), schema=DECISIONS_SCHEMA, wal=True):
+    """Bot db like journal_store's. wal=True keeps a second connection open so -wal/-shm stay beside it
+    (returned; caller closes) the way the live writer does."""
+    import sqlite3
+    p = os.path.join(root, path.lstrip("/"))
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    con = sqlite3.connect(p)
+    if wal:
+        con.execute("PRAGMA journal_mode=WAL")
+    for stmt in schema:
+        con.execute(stmt)
+    for row in rows:
+        con.execute(f"INSERT INTO decisions ({','.join(row)}) VALUES ({','.join('?' * len(row))})", list(row.values()))
+    con.commit()
+    if wal:
+        con.execute("SELECT 1").fetchone()
+        return con
+    con.close()
+    return None
+
+
 # ── fake Phase C inputs ────────────────────────────────────────────────────
 
 EVAL = "/opt/stacks/bull-pilot/bot/reports/evaluation"

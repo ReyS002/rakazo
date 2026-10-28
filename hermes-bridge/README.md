@@ -156,8 +156,9 @@ unauthenticated caller gets 401/403 for every `/observe/...` path.
   `{"ok":true,"snapshots":[{"name","generated_at","age_s","ok","stale"}, ...]}` for the snapshots that exist,
   in the order below. An unreadable one is listed as
   `{"name":..., "generated_at":null, "age_s":null, "ok":false, "stale":true, "error":"bad snapshot"}`.
-- `GET .../observe/<name>`, `<name>` exactly one of `health scanner paper projects vault logs`
-  (case-sensitive, no extension, no percent-decoding; anything else -> 404). Returns the stored envelope
+- `GET .../observe/<name>`, `<name>` exactly one of `health scanner paper projects vault logs narrow nrs
+  journals phasec robinhood` (case-sensitive, no extension, no percent-decoding; anything else -> 404).
+  `journals` is special (index + slices, see below); every other name returns the stored envelope
   plus `age_s` (seconds since `generated_at`, never negative) and `stale` (`age_s > 600`; stale is a warning,
   the snapshot is still served):
 
@@ -169,16 +170,76 @@ unauthenticated caller gets 401/403 for every `/observe/...` path.
   `ok:false` + `error` means the collector failed that section; `data` may be partial, `{}` or `null`.
   Data shapes per name: see the collector's spec / README.
 - `404 {"ok":false,"error":"no snapshot yet"}` file missing; `502 {"ok":false,"error":"bad snapshot"}` if the
-  file is a symlink, not a regular file, > 256 KB, not UTF-8 JSON (NaN/Infinity rejected), not an object, or
+  file is a symlink, not a regular file, > 256 KB (journals: > 8 MB), not UTF-8 JSON (NaN/Infinity rejected), not an object, or
   lacks a valid envelope (`name` = the requested name, `generated_at` ISO-8601 string, `ok` bool,
   `error` null/string, `data` object/null). Errors never echo file contents.
-- `401`/`403` auth, `405` non-GET, `429` at 60/min (own limiter for both routes, see `Retry-After`),
+- `401`/`403` auth, `405` non-GET, `429` at 60/min (own limiter for `/observe` + `/observe/<name>`;
+  `/observe/journals` has its own 120/min limiter, see `Retry-After`),
   `503` if `KILL` or `KILL_OBSERVE` exists. Every response has `Cache-Control: no-store`.
-  Logs: `route=observe`, status and the name (allowlisted names only), never contents.
+  Logs: `route=observe`, status and the name (allowlisted names only; journals adds `view=index|slice` and the
+  validated `section`), never contents or query values.
+
+### `GET /observe/journals`: index and slices
+
+The journals snapshot (paper fills, stop orders, positions, closed trades and decision journals for today and the
+previous weekday, up to 8 MB; ~3.9 MB on two real days with the TYWQ/JI68/RH5Y db decisions) is never sent whole. Same key class (`OBS_KEYS`), same kill switches, same
+auth-before-anything order; the relay still opens only `journals.json`.
+
+- No query -> compact **index** (< 20 KB, ~3 KB on real data): `{ok, name, generated_at, age_s, stale, error,
+  exports_stale, missing, catalog, usage}`. `catalog.<today|prev_weekday> = {date, bots:[{label, code, fills,
+  stop_orders, open_positions, closed_trades, decisions, truncated_at_source:[lists], first_time_et,
+  last_time_et}]}`; a count is `null` when that bot has no such source that day (no paper-fills export / no
+  `<bot>-decisions` export / bot db). `usage` repeats the query syntax. TYWQ, JI68 and RH5Y decisions come
+  from each bot's own SQLite `decisions` table (collector, read-only); their rows are `{time, time_et, symbol,
+  decision (= db status), reason, side, play, qty, order_type, entry, stop, target, timeframe, location,
+  max_dollar_risk}`.
+- `?day=..&bot=..&section=..[&offset][&limit][&before][&after][&status]` -> one **slice**:
+
+  | param | values |
+  |---|---|
+  | `day` (required) | `today`, `prev_weekday`, or `YYYY-MM-DD` of one of those two days |
+  | `bot` (required) | label, case-insensitive (`Unchained`, `velez trading`, ...) or code: `PYPV` Unchained, `JI68` Bull Pilot, `TYWQ` Velez Trading, `RH5Y` Swing, `7E3U` BullMatrix |
+  | `section` (required) | `fills`, `stop_orders`, `open_positions`, `closed_trades`, `decisions` |
+  | `offset` | integer >= 0, default 0 |
+  | `limit` | 1..500, default 200 |
+  | `after` (decisions only) | `HH:MM` ET, **inclusive** (row time >= HH:MM:00) |
+  | `before` (decisions only) | `HH:MM` ET, **exclusive** (row time < HH:MM:00); `after=X` + `before=X` split a day with no gap/overlap |
+  | `status` (decisions only) | `passed`, `not_passed` (taken, approval_needed, errors, ...), `all` (default) |
+
+  ```json
+  {"ok": true, "name": "journals", "generated_at": "...", "age_s": 42, "stale": false,
+   "day": "2026-10-27", "day_key": "today", "bot": {"label": "Unchained", "code": "PYPV"},
+   "section": "decisions", "filters": {"before": "15:45", "after": null, "status": "all"},
+   "total": 1872, "offset": 0, "limit": 200, "returned": 160, "next_offset": 160,
+   "truncated_at_source": false, "rows": [{"time": "2026-10-27T04:00:01Z", "time_et": "00:00:01", ...}]}
+  ```
+
+  `total` counts rows after the filters; rows are in time order (`time` UTC, `time_et` ET clock); only that
+  bot's rows are returned. The reply is capped at 40 KB: `returned` may be lower than `limit` (whole rows only)
+  — keep calling with `offset=next_offset` until it is `null`. `truncated_at_source: true` = the collector kept
+  fewer rows than the export had (caps: 3000 decisions / 1000 other rows per bot-day, or the 8 MB file cap).
+  Rows never carry id/account/key-like fields (dropped by the collector and again by the relay).
+- Errors (`{"ok":false,"error":"<plain message>"}`, never echoing input): `400` unknown parameter, repeated
+  parameter, malformed value, `before`/`after`/`status` on a non-decisions section; `404` day / bot / section
+  omitted or not in the snapshot (the message lists the valid values), or that bot has no such source that day
+  (e.g. `no decisions export with decisions for Velez Trading on 2026-10-27` — only `unchained-decisions` is
+  exported today); `404 no snapshot yet`; `502 bad snapshot`.
+
+Bull Mentor worked examples (Bearer = an `OBS_KEYS` entry; base
+`https://desk.72.62.169.3.nip.io/hermes-bridge`):
+
+1. Freshness + plan: `GET /observe/journals` -> read `catalog.today.bots[]` for the counts and time range.
+2. "Stop orders for PYPV today": `GET /observe/journals?day=today&bot=PYPV&section=stop_orders`
+   (a handful of rows, one call).
+3. "TYWQ decisions before 15:45 today": `GET /observe/journals?day=today&bot=TYWQ&section=decisions&before=15:45`
+   — today this is a 404 because no TYWQ decision journal is exported; the same call with `bot=PYPV` works.
+4. "Walk all decisions": `GET /observe/journals?day=today&bot=PYPV&section=decisions&limit=500`, then repeat with
+   `&offset=<next_offset>` until `next_offset` is `null` (~13 calls for a 2000-row day; stay under 120/min).
+   Only the non-pass rows: add `&status=not_passed` (usually one call).
 
 Where files live: the collector writes `/opt/stacks/bull-desk/hermes-bridge-run/observe/<name>.json`
 (dir 0755, files 0644, tmp + atomic rename). The container sees it read-only as `/run/bridge/observe`
-(`OBSERVE_DIR` overrides) through the existing `hermes-bridge-run` mount; the relay opens only the six
+(`OBSERVE_DIR` overrides) through the existing `hermes-bridge-run` mount; the relay opens only the eleven
 fixed file names, with `O_NOFOLLOW`, and never builds a path from request input.
 
 Kill switch (observe only; `KILL` stops everything):

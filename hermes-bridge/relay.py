@@ -11,7 +11,8 @@ GET /results (same TASK_KEYS) serves the sanitized status files Hermes publishes
 into RESULTS_DIR (read-only mount); it never touches anything else.
 GET /observe[/<name>] (enabled only when OBS_KEYS is set) serves the oversight
 snapshots a host-side collector writes into OBSERVE_DIR (read-only mount); only
-the seven allowlisted file names are ever opened.
+the allowlisted file names are ever opened. /observe/journals is never served whole: no query -> a compact
+index, ?day=&bot=&section=... -> one bounded page of one bot's list.
 """
 
 import collections
@@ -62,6 +63,40 @@ OBSERVE_ENVELOPE = ("name", "generated_at", "ok", "error", "data")
 OBSERVE_PER_MINUTE = 60
 OBSERVE_STALE_S = 600
 MAX_SNAPSHOT_FILE = 256 * 1024
+SNAPSHOT_MAX_BYTES = {"journals": 8 << 20}  # journals is never served whole: see journals_index/journals_slice
+JOURNALS_PER_MINUTE = 120                   # own limiter for /observe/journals (index + slices)
+JOURNALS_INDEX_MAX = 20 * 1024
+JOURNALS_SLICE_MAX = 40 * 1024
+JOURNALS_SECTIONS = ("fills", "stop_orders", "open_positions", "closed_trades", "decisions")
+JOURNALS_PARAMS = ("day", "bot", "section", "offset", "limit", "before", "after", "status")
+JOURNALS_DECISION_PARAMS = ("before", "after", "status")
+JOURNALS_DAY_KEYS = ("today", "prev_weekday")
+JOURNALS_LIMIT_DEFAULT = 200
+JOURNALS_LIMIT_MAX = 500
+JOURNALS_STATUS = ("passed", "not_passed", "all")
+# Paper-fills lists come from data.days.<day>.paper_fills.bots.<label>, the others from .decisions.<file prefix>.
+_PAPER_LISTS = {"fills": "fill_count", "stop_orders": "stop_order_count", "open_positions": "open_position_count"}
+_DECISION_LISTS = {"decisions": "decisions_total", "closed_trades": "closed_trades_count"}
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_BOT_RE = re.compile(r"[A-Za-z0-9 _.-]{1,40}")
+_SECTION_RE = re.compile(r"[a-z0-9_]{1,20}")
+_INT_RE = re.compile(r"[0-9]{1,7}")
+_HHMM_RE = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
+_ROW_TIME_RE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z")
+# Defense in depth on top of the collector's scrub: never pass on id/account/key-like fields or nested values.
+_ROW_DENY_RE = re.compile(r"(?i)(?:^|_)(?:ids?|account\w*|keys?|tokens?|secrets?|password\w*)(?:$|_)")
+JOURNALS_USAGE = (
+    "GET /observe/journals?day=<today|prev_weekday|YYYY-MM-DD>&bot=<label or code>&section=<section>"
+    "[&offset=N][&limit=N][&before=HH:MM][&after=HH:MM][&status=passed|not_passed|all]. "
+    "day, bot and section are required. section: fills, stop_orders, open_positions, closed_trades, decisions. "
+    "bot: label (case-insensitive) or code (PYPV Unchained, JI68 Bull Pilot, TYWQ Velez Trading, RH5Y Swing, "
+    "7E3U BullMatrix). offset >= 0 (default 0), limit 1..500 (default 200); a reply is capped at 40 KB, so it "
+    "may return fewer rows than limit: keep calling with offset=next_offset until next_offset is null. "
+    "decisions only: after=HH:MM (ET, inclusive) and before=HH:MM (ET, exclusive) filter by time of day, "
+    "status filters passed vs every other decision. Rows are in time order; `time` is UTC, `time_et` the ET clock. "
+    "truncated_at_source=true means the "
+    "collector kept fewer rows than the export had."
+)
 
 # C0/C1 controls except "\n", plus bidi overrides that can spoof rendered text.
 _STRIP = {c for c in range(0x20) if c != 0x0A} | {0x7F} | set(range(0x80, 0xA0))
@@ -308,6 +343,7 @@ def read_snapshot(name, observe_dir=None, now=None):
     if filename is None:
         raise SnapshotMissing()
     path = os.path.join(observe_dir or OBSERVE_DIR, filename)
+    max_bytes = SNAPSHOT_MAX_BYTES.get(name, MAX_SNAPSHOT_FILE)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -317,12 +353,12 @@ def read_snapshot(name, observe_dir=None, now=None):
     try:
         with os.fdopen(fd, "rb") as fh:
             st = os.fstat(fh.fileno())
-            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_SNAPSHOT_FILE:
+            if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
                 raise SnapshotBad()
-            raw = fh.read(MAX_SNAPSHOT_FILE + 1)
+            raw = fh.read(max_bytes + 1)
     except OSError:
         raise SnapshotBad() from None
-    if len(raw) > MAX_SNAPSHOT_FILE:
+    if len(raw) > max_bytes:
         raise SnapshotBad()
     try:
         data = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
@@ -354,6 +390,285 @@ def observe_index(observe_dir=None, now=None):
             continue
         out.append({key: data[key] for key in ("name", "generated_at", "age_s", "ok", "stale")})
     return out
+
+
+# ── /observe/journals: compact index + bounded slices ────────────────────
+
+def _nth_sunday(year, month, n):
+    first = datetime.date(year, month, 1)
+    return first + datetime.timedelta(days=(6 - first.weekday()) % 7 + 7 * (n - 1))
+
+
+def utc_to_et(when):
+    """Aware UTC datetime -> US Eastern wall clock (rules since 2007: 2nd Sun Mar 07:00Z .. 1st Sun Nov 06:00Z).
+    Stdlib only, no tzdata needed in the slim image."""
+    start = datetime.datetime.combine(_nth_sunday(when.year, 3, 2), datetime.time(7), datetime.timezone.utc)
+    end = datetime.datetime.combine(_nth_sunday(when.year, 11, 1), datetime.time(6), datetime.timezone.utc)
+    hours = -4 if start <= when < end else -5
+    return when.astimezone(datetime.timezone(datetime.timedelta(hours=hours)))
+
+
+def _row_et(row):
+    """ET datetime of a row's collector "time" ("YYYY-MM-DDTHH:MM:SSZ"), else None."""
+    value = row.get("time")
+    m = _ROW_TIME_RE.fullmatch(value) if isinstance(value, str) else None
+    if m is None:
+        return None
+    try:
+        when = datetime.datetime(*map(int, m.groups()), tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return utc_to_et(when)
+
+
+def _clean_row(row):
+    return {k: v for k, v in row.items() if isinstance(k, str) and not _ROW_DENY_RE.search(k)
+            and (v is None or isinstance(v, (str, int, float, bool)))}
+
+
+def _out_row(row):
+    """A row as served: cleaned, plus "time_et" (HH:MM:SS US Eastern) when it has a collector "time"."""
+    out = _clean_row(row)
+    when = _row_et(row)
+    if when is not None:
+        out["time_et"] = when.strftime("%H:%M:%S")
+    return out
+
+
+def _list(value):
+    return [r for r in value if isinstance(r, dict)] if isinstance(value, list) else None
+
+
+def _total(block, section, legacy):
+    """Rows the export had for that list (collector `lists` meta, else the legacy count field), or None."""
+    meta = block.get("lists") if isinstance(block.get("lists"), dict) else {}
+    meta = meta.get(section) if isinstance(meta.get(section), dict) else {}
+    for value in (meta.get("total_rows"), block.get(legacy)):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def journal_days(data):
+    """[(key, date, day block)] for the snapshot's days (today, prev_weekday) with a valid date."""
+    days = data.get("days") if isinstance(data, dict) else None
+    out = []
+    if isinstance(days, dict):
+        for key in JOURNALS_DAY_KEYS:
+            day = days.get(key)
+            if isinstance(day, dict) and isinstance(day.get("date"), str) and _DATE_RE.fullmatch(day["date"]):
+                out.append((key, day["date"], day))
+    return out
+
+
+def journal_bots(day):
+    """Bots of one day: paper-fills and decisions entries merged by code (else by lowercase label).
+
+    Each: {"label", "code", "names" (lowercase match keys), "lists": {section: rows or None (no source)},
+    "totals": {section: export row count or None}}.
+    """
+    bots = {}
+
+    def entry(label, code):
+        code = code if isinstance(code, str) and _BOT_RE.fullmatch(code) else None
+        key = code or label.lower()
+        if key not in bots:
+            bots[key] = {"label": label, "code": code, "names": set(), "lists": dict.fromkeys(JOURNALS_SECTIONS),
+                         "totals": dict.fromkeys(JOURNALS_SECTIONS)}
+        bots[key]["names"].add(label.lower())
+        if code:
+            bots[key]["names"].add(code.lower())
+        return bots[key]
+
+    def fill(e, block, sections):
+        for section, legacy in sections.items():
+            rows = _list(block.get(section))
+            if rows is not None:
+                e["lists"][section] = rows
+                e["totals"][section] = _total(block, section, legacy)
+
+    pf = day.get("paper_fills")
+    if isinstance(pf, dict) and pf.get("ok") is True and isinstance(pf.get("bots"), dict):
+        for label, block in pf["bots"].items():
+            if isinstance(label, str) and _BOT_RE.fullmatch(label) and isinstance(block, dict):
+                fill(entry(label, block.get("code")), block, _PAPER_LISTS)
+    decisions = day.get("decisions")
+    if isinstance(decisions, dict):
+        for slug, block in decisions.items():
+            if not (isinstance(slug, str) and isinstance(block, dict) and block.get("ok") is True):
+                continue
+            label = block.get("label") if isinstance(block.get("label"), str) else slug
+            if not _BOT_RE.fullmatch(label):
+                continue
+            e = entry(label, block.get("code"))
+            if _BOT_RE.fullmatch(slug):
+                e["names"].add(slug.lower())
+            fill(e, block, _DECISION_LISTS)
+    return list(bots.values())
+
+
+def _truncated(bot, section):
+    rows, total = bot["lists"][section], bot["totals"][section]
+    return rows is not None and total is not None and len(rows) < total
+
+
+def _catalog_bot(bot):
+    out = {"label": bot["label"], "code": bot["code"]}
+    out.update({s: (len(rows) if rows is not None else None) for s, rows in bot["lists"].items()})
+    out["truncated_at_source"] = [s for s in JOURNALS_SECTIONS if _truncated(bot, s)]
+    times = [t for t in map(_row_et, bot["lists"]["decisions"] or ()) if t is not None]
+    out["first_time_et"] = min(times).isoformat() if times else None
+    out["last_time_et"] = max(times).isoformat() if times else None
+    return out
+
+
+def _envelope_head(env):
+    return {"name": "journals", "generated_at": env["generated_at"], "age_s": env["age_s"], "stale": env["stale"]}
+
+
+def journals_index(env):
+    """Compact (< JOURNALS_INDEX_MAX) map of the journals snapshot: what exists, how many rows, how to slice."""
+    data = env["data"] if isinstance(env["data"], dict) else {}
+    catalog, missing = {}, []
+    for key, date, day in journal_days(data):
+        catalog[key] = {"date": date, "bots": [_catalog_bot(b) for b in journal_bots(day)]}
+        if isinstance(day.get("missing"), list):
+            missing += [m[:200] for m in day["missing"][:10] if isinstance(m, str)]
+    body = {"ok": env["ok"], **_envelope_head(env), "error": env["error"],
+            "exports_stale": data.get("stale") if isinstance(data.get("stale"), bool) else None,
+            "missing": missing, "catalog": catalog, "usage": JOURNALS_USAGE}
+    while len(json.dumps(body)) > JOURNALS_INDEX_MAX:
+        biggest = max(catalog.values(), key=lambda d: len(d["bots"]), default=None)
+        if biggest and biggest["bots"]:
+            biggest["bots"].pop()
+            body["catalog_truncated"] = True
+        elif body["missing"]:
+            body["missing"].pop()
+        else:
+            break
+    return body
+
+
+class JournalsError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def parse_journals_query(query):
+    """Validated slice parameters from a raw query string; raises JournalsError(400) on any bad input.
+    Never echoes input back in the message."""
+    try:
+        params = urllib.parse.parse_qs(query, keep_blank_values=True, max_num_fields=len(JOURNALS_PARAMS))
+    except ValueError:
+        raise JournalsError(400, "too many query parameters") from None
+    if any(name not in JOURNALS_PARAMS for name in params):
+        raise JournalsError(400, "unknown query parameter; allowed: " + ", ".join(JOURNALS_PARAMS))
+    if any(len(values) != 1 for values in params.values()):
+        raise JournalsError(400, "each query parameter may appear only once")
+    p = {name: values[0] for name, values in params.items()}
+    out = {"offset": 0, "limit": JOURNALS_LIMIT_DEFAULT, "before": None, "after": None, "status": "all"}
+    day = p.get("day")
+    if day is not None and day not in JOURNALS_DAY_KEYS and not _DATE_RE.fullmatch(day):
+        raise JournalsError(400, "day must be today, prev_weekday or YYYY-MM-DD")
+    bot = p.get("bot")
+    if bot is not None and not _BOT_RE.fullmatch(bot):
+        raise JournalsError(400, "bot must be a label or code (letters, digits, space . _ -; max 40)")
+    section = p.get("section")
+    if section is not None and not _SECTION_RE.fullmatch(section):
+        raise JournalsError(400, "section must be one of: " + ", ".join(JOURNALS_SECTIONS))
+    out.update(day=day, bot=bot, section=section)
+    for name, low, high in (("offset", 0, None), ("limit", 1, JOURNALS_LIMIT_MAX)):
+        if name in p:
+            value = p[name]
+            if not _INT_RE.fullmatch(value) or int(value) < low or (high is not None and int(value) > high):
+                raise JournalsError(400, f"{name} must be an integer >= {low}" + (f" and <= {high}" if high else ""))
+            out[name] = int(value)
+    for name in ("before", "after"):
+        if name in p:
+            m = _HHMM_RE.fullmatch(p[name])
+            if m is None:
+                raise JournalsError(400, f"{name} must be HH:MM (24h, ET)")
+            out[name] = (int(m.group(1)), int(m.group(2)))
+    if "status" in p:
+        if p["status"] not in JOURNALS_STATUS:
+            raise JournalsError(400, "status must be one of: " + ", ".join(JOURNALS_STATUS))
+        out["status"] = p["status"]
+    if section is not None and section != "decisions" and any(n in p for n in JOURNALS_DECISION_PARAMS):
+        raise JournalsError(400, "before, after and status apply only to section=decisions")
+    return out
+
+
+def _select_rows(rows, q):
+    if q["status"] != "all":
+        rows = [r for r in rows if (r.get("decision") == "passed") == (q["status"] == "passed")]
+    if q["before"] or q["after"]:
+        kept = []
+        for r in rows:
+            t = _row_et(r)
+            if t is None:
+                continue
+            hm = (t.hour, t.minute, t.second)
+            if q["after"] and hm < q["after"] + (0,):
+                continue
+            if q["before"] and hm >= q["before"] + (0,):
+                continue
+            kept.append(r)
+        rows = kept
+    return rows
+
+
+def journals_slice(env, q):
+    """One page of one bot's list for one day; the encoded reply stays <= JOURNALS_SLICE_MAX.
+
+    Raises JournalsError(404) (with the valid values) for an absent/unknown day, bot or section.
+    """
+    days = journal_days(env["data"] if isinstance(env["data"], dict) else {})
+    if not days:
+        raise JournalsError(404, "no journal days in the snapshot (see GET /observe/journals)")
+    valid_days = ", ".join([k for k, _, _ in days] + [d for _, d, _ in days])
+    match = [(k, d, day) for k, d, day in days if q["day"] in (k, d)] if q["day"] else []
+    if not match:
+        raise JournalsError(404, ("unknown day" if q["day"] else "day is required") + "; valid: " + valid_days)
+    key, date, day = match[0]
+    bots = journal_bots(day)
+    names = ", ".join(f"{b['label']} ({b['code']})" if b["code"] else b["label"] for b in bots) or "none"
+    found = [b for b in bots if q["bot"] and q["bot"].lower() in b["names"]]
+    if not found:
+        raise JournalsError(404, ("unknown bot" if q["bot"] else "bot is required")
+                            + f" for {date}; valid: {names}")
+    bot = found[0]
+    if q["section"] not in JOURNALS_SECTIONS:
+        raise JournalsError(404, ("unknown section" if q["section"] else "section is required")
+                            + "; valid: " + ", ".join(JOURNALS_SECTIONS))
+    rows = bot["lists"][q["section"]]
+    if rows is None:
+        source = "paper-fills export" if q["section"] in _PAPER_LISTS else "decisions export"
+        raise JournalsError(404, f"no {source} with {q['section']} for {bot['label']} on {date}")
+    rows = _select_rows(rows, q)
+    total, offset = len(rows), q["offset"]
+    body = {"ok": True, **_envelope_head(env), "day": date, "day_key": key,
+            "bot": {"label": bot["label"], "code": bot["code"]}, "section": q["section"],
+            "filters": {"before": "%02d:%02d" % q["before"] if q["before"] else None,
+                        "after": "%02d:%02d" % q["after"] if q["after"] else None, "status": q["status"]},
+            "total": total, "offset": offset, "limit": q["limit"], "returned": 0,
+            "next_offset": 10 ** 9, "truncated_at_source": _truncated(bot, q["section"]), "rows": []}
+    budget = JOURNALS_SLICE_MAX - len(json.dumps(body))
+    page = []
+    for row in rows[offset:offset + q["limit"]]:
+        row = _out_row(row)
+        cost = len(json.dumps(row)) + 2
+        if page and cost > budget:
+            break
+        page.append(row)
+        budget -= cost
+    body.update(rows=page, returned=len(page),
+                next_offset=offset + len(page) if offset + len(page) < total and page else None)
+    while len(json.dumps(body)) > JOURNALS_SLICE_MAX and len(page) > 1:  # belt and braces
+        page.pop()
+        body.update(returned=len(page), next_offset=offset + len(page))
+    return body
 
 
 def sign(secret, timestamp, body):
@@ -413,7 +728,7 @@ def log(status, nbytes, label, extra=""):
     print(f"{ts} status={status} bytes={nbytes} from={label}{extra}", flush=True)
 
 
-def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter):
+def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter, journals_limiter):
     task_config = config.get("task")
     observe_config = config.get("observe")
     post_paths = {"/notify", "/task"} if task_config else {"/notify"}
@@ -580,7 +895,7 @@ def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter
             if not self._authorized(observe_config["keys"], extra, headers=nostore):
                 return
 
-            wait = observe_limiter.acquire()
+            wait = (journals_limiter if path == "/observe/journals" else observe_limiter).acquire()
             if wait:
                 return self._send(429, {"ok": False}, headers={**nostore, "Retry-After": str(wait)}, extra=extra)
 
@@ -590,13 +905,28 @@ def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter
             if name not in OBSERVE_FILES:
                 return self._send(404, {"ok": False}, headers=nostore, extra=extra)
             extra += f" name={name}"
+            query = urllib.parse.urlsplit(self.path).query if name == "journals" else ""
+            if query:
+                try:
+                    q = parse_journals_query(query)
+                except JournalsError as exc:
+                    return self._send(exc.status, {"ok": False, "error": exc.message}, headers=nostore, extra=extra)
             try:
                 data = read_snapshot(name)
             except SnapshotMissing:
                 return self._send(404, {"ok": False, "error": "no snapshot yet"}, headers=nostore, extra=extra)
             except SnapshotBad:
                 return self._send(502, {"ok": False, "error": "bad snapshot"}, headers=nostore, extra=extra)
-            return self._send(200, data, headers=nostore, extra=extra)
+            if name != "journals":
+                return self._send(200, data, headers=nostore, extra=extra)
+            if not query:
+                return self._send(200, journals_index(data), headers=nostore, extra=extra + " view=index")
+            extra += " view=slice"
+            try:
+                body = journals_slice(data, q)
+            except JournalsError as exc:
+                return self._send(exc.status, {"ok": False, "error": exc.message}, headers=nostore, extra=extra)
+            return self._send(200, body, headers=nostore, extra=extra + f" section={body['section']}")
 
         def _not_allowed(self):
             path = self._path()
@@ -624,10 +954,15 @@ def make_observe_limiter(clock=time.monotonic):
     return RateLimiter(clock=clock, windows=[(60.0, OBSERVE_PER_MINUTE)])
 
 
+def make_journals_limiter(clock=time.monotonic):
+    return RateLimiter(clock=clock, windows=[(60.0, JOURNALS_PER_MINUTE)])
+
+
 def make_server(config, host=HOST, port=PORT, limiter=None, task_limiter=None, results_limiter=None,
-                observe_limiter=None):
+                observe_limiter=None, journals_limiter=None):
     handler = make_handler(config, limiter or RateLimiter(), task_limiter or make_task_limiter(),
-                           results_limiter or make_results_limiter(), observe_limiter or make_observe_limiter())
+                           results_limiter or make_results_limiter(), observe_limiter or make_observe_limiter(),
+                           journals_limiter or make_journals_limiter())
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     return server
