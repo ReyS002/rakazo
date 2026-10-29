@@ -136,7 +136,7 @@ class Runner:
 
 # ── GET-only HTTP ───────────────────────────────────────────────────────────
 
-ALLOWED_HOSTS = frozenset({"paper-api.alpaca.markets", "api-fxpractice.oanda.com"})
+ALLOWED_HOSTS = frozenset({"paper-api.alpaca.markets", "api-fxpractice.oanda.com", "data.alpaca.markets"})
 MAX_BODY = 4 << 20
 
 

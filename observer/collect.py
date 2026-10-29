@@ -5,7 +5,7 @@ collect.py [--only health,scanner,...] [--out DIR] [--once]
 
 Read-only: fixed git/docker/systemctl/df argv shapes, GET-only HTTP to paper/practice hosts, file reads.
 Every snapshot is scrubbed, re-checked for leaks (dropped to ok:false if any rule still matches),
-capped at 200 KB (narrow/nrs/phasec/robinhood: 150 KB, journals: 8 MB) and written atomically (tmp + os.replace, 0644). One lock per section prevents overlap.
+capped at 200 KB (narrow/nrs/phasec/robinhood: 150 KB, journals: 8 MB, bars: 2 MB) and written atomically (tmp + os.replace, 0644). One lock per section prevents overlap.
 """
 
 import argparse
@@ -22,19 +22,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import deps as d  # noqa: E402
 import scrub  # noqa: E402
-from sections import (health, iso, journals, logs, narrow, nrs, paper, phasec, projects,  # noqa: E402
+from sections import (bars, health, iso, journals, logs, narrow, nrs, paper, phasec, projects,  # noqa: E402
                       robinhood, scanner, vault)
 
 DEFAULT_OUT = "/opt/stacks/bull-desk/hermes-bridge-run/observe"
 SECTIONS = {"health": health.collect, "scanner": scanner.collect, "paper": paper.collect,
             "projects": projects.collect, "vault": vault.collect, "logs": logs.collect, "narrow": narrow.collect,
-            "nrs": nrs.collect, "journals": journals.collect, "phasec": phasec.collect, "robinhood": robinhood.collect}
+            "nrs": nrs.collect, "journals": journals.collect, "phasec": phasec.collect, "robinhood": robinhood.collect,
+            "bars": bars.collect}
 BUDGET_S = 60.0
 HARD_STOP_S = 75
 MAX_BYTES = 200 * 1024
 SECTION_MAX_BYTES = {n: 150 * 1024 for n in ("narrow", "nrs", "phasec", "robinhood")}
 # Full trading days for 4 bots (real: ~3.9 MB for two days); the relay slices it, never serves it whole.
 SECTION_MAX_BYTES["journals"] = 8 << 20
+SECTION_MAX_BYTES["bars"] = 2 << 20  # 40 symbols x 2 days x (2m + 5m) is ~0.6 MB; bars.py trims below this itself
 PREV_MAX_BYTES = max(1 << 20, *SECTION_MAX_BYTES.values())
 ERROR_MAX = 200
 

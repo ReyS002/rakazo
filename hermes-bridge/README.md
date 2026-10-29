@@ -157,8 +157,8 @@ unauthenticated caller gets 401/403 for every `/observe/...` path.
   in the order below. An unreadable one is listed as
   `{"name":..., "generated_at":null, "age_s":null, "ok":false, "stale":true, "error":"bad snapshot"}`.
 - `GET .../observe/<name>`, `<name>` exactly one of `health scanner paper projects vault logs narrow nrs
-  journals phasec robinhood` (case-sensitive, no extension, no percent-decoding; anything else -> 404).
-  `journals` is special (index + slices, see below); every other name returns the stored envelope
+  journals phasec robinhood bars` (case-sensitive, no extension, no percent-decoding; anything else -> 404).
+  `journals`, `nrs` and `bars` are special (index + slices, see below); every other name returns the stored envelope
   plus `age_s` (seconds since `generated_at`, never negative) and `stale` (`age_s > 600`; stale is a warning,
   the snapshot is still served):
 
@@ -170,14 +170,15 @@ unauthenticated caller gets 401/403 for every `/observe/...` path.
   `ok:false` + `error` means the collector failed that section; `data` may be partial, `{}` or `null`.
   Data shapes per name: see the collector's spec / README.
 - `404 {"ok":false,"error":"no snapshot yet"}` file missing; `502 {"ok":false,"error":"bad snapshot"}` if the
-  file is a symlink, not a regular file, > 256 KB (journals: > 8 MB), not UTF-8 JSON (NaN/Infinity rejected), not an object, or
+  file is a symlink, not a regular file, > 256 KB (journals: > 8 MB, bars: > 2 MB), not UTF-8 JSON (NaN/Infinity rejected), not an object, or
   lacks a valid envelope (`name` = the requested name, `generated_at` ISO-8601 string, `ok` bool,
   `error` null/string, `data` object/null). Errors never echo file contents.
 - `401`/`403` auth, `405` non-GET, `429` at 60/min (own limiter for `/observe` + `/observe/<name>`;
   `/observe/journals` has its own 120/min limiter, see `Retry-After`),
   `503` if `KILL` or `KILL_OBSERVE` exists. Every response has `Cache-Control: no-store`.
-  Logs: `route=observe`, status and the name (allowlisted names only; journals adds `view=index|slice` and the
-  validated `section`), never contents or query values.
+  Logs: `route=observe`, status and the name (allowlisted names only; journals/nrs/bars add
+  `view=index|slice|full` and the validated `section` or `tf`), never contents, symbols or other query values.
+  `/observe/nrs` and `/observe/bars` share the 60/min observe limiter.
 
 ### `GET /observe/journals`: index and slices
 
@@ -237,9 +238,72 @@ Bull Mentor worked examples (Bearer = an `OBS_KEYS` entry; base
    `&offset=<next_offset>` until `next_offset` is `null` (~13 calls for a 2000-row day; stay under 120/min).
    Only the non-pass rows: add `&status=not_passed` (usually one call).
 
+### `GET /observe/nrs`: index and slices
+
+The full NRS snapshot (~40 KB) is longer than a bot HTTP tool reads, so plain `/observe/nrs` is now an index.
+Every reply here (index and slices) is <= 12 KB.
+
+- No query -> **index** (~2.5 KB on real data): `{ok, name, generated_at, age_s, stale, error, exports_stale,
+  today_et, markets, sections, slice_max_bytes, usage}`. `markets.<stock|forex|crypto> = {ok, reason, as_of,
+  age_s (now - as_of), stale, export_error, watchlist_scan_date, recent_triggers, triggers_today, watchlist,
+  export_counts, new_since_prev: {watchlist, recent_triggers}, bytes: {<section>: size}}`. A market the
+  collector could not read shows `ok:false` + `reason`.
+- `?market=..[&section=..][&offset][&limit][&symbol][&since]` -> one **slice**:
+
+  | param | values |
+  |---|---|
+  | `market` (required) | `stock`, `forex`, `crypto` |
+  | `section` | `summary` (default: export meta + counts), `recent_triggers` (alias `triggers`, newest first), `watchlist`, `heartbeats`, `new_since_prev` |
+  | `offset`, `limit` (lists only) | offset >= 0; limit 1..200, default 50 |
+  | `symbol` (lists only) | exact symbol, any case (`IOVA`, `eur_jpy`, `BTC/USD`) |
+  | `since` (recent_triggers only) | `HH:MM` ET: triggers fired **today (ET)** at or after that time |
+
+  Lists reply `{..., market, section, as_of, market_stale, filters, total, offset, limit, returned, next_offset,
+  rows}`; trigger rows add `triggered_at_et` (`YYYY-MM-DD HH:MM` ET). Keep calling with `offset=next_offset`
+  until it is `null` (the real stock watchlist is 2 pages).
+- `?full=1` (alone) -> the old whole envelope, for callers that can read 40 KB.
+- Errors as for journals: `400` bad/unknown/repeated parameter or a filter on the wrong section; `404` market
+  missing or not in the snapshot (message lists the valid ones).
+
+### `GET /observe/bars`: index and slices
+
+Regular-session (09:30-16:00 ET) 2-minute and 5-minute stock bars for today and the previous weekday, for the
+symbols the desk just touched (today's NRS stock triggers, stock scanner fires, journal fills / closed trades /
+decisions with an entry; <= 40 symbols, newest first). Collector: `observer/sections/bars.py`. Never served
+whole; every reply <= 12 KB.
+
+- No query -> **index** (~3 KB for 22 symbols): `{ok, name, generated_at, age_s, stale, error, source, feed
+  (sip|iex), as_of, data_stale, latest_bar_et, timeframes, days: {today|prev_weekday: {date, session}}, symbols,
+  counts: {SYM: {today: {2m, 5m}, prev_weekday: {2m, 5m}}}, dropped_for_cap, dropped_for_size, bar_format,
+  usage}`. `session` is `open`, `closed`, `not_started` or `no_session` (weekend). Use `data_stale` (the
+  collector's view: fetch failed, or no bar in 20 min during the session); the envelope `stale` only says the
+  file is > 10 min old, which is normal outside the session (the timer runs 09:30-16:25 ET).
+- `?symbol=SYM[&tf=2m|5m][&day=today|prev_weekday|YYYY-MM-DD][&from=HH:MM][&to=HH:MM][&offset][&limit]` ->
+  `{..., feed, data_stale, symbol, tf, day, day_key, session, filters, bar_format, total, offset, limit, returned,
+  next_offset, rows}`. Defaults `tf=5m`, `day=today`, `limit` 200 (1..400). Rows are
+  `[t_et, open, high, low, close, volume]`, `t_et` = ET bar **start** (`"10:35"`); `from`/`to` are inclusive bar
+  starts. A full 2m day (195 bars) fits in one reply on real data.
+- Errors: `400` bad tf/day/time/limit, `from` > `to`, unknown parameter; `404` symbol missing or not in the
+  snapshot, day not in the snapshot (messages list valid values).
+- Bars are never invented: if the Alpaca call failed, the index says `ok:false` + `error` and the lists are
+  empty (`counts` 0).
+
+Bull Mentor: "would you take this?" quiz + replay
+
+1. `GET /observe/nrs` -> `markets.stock.triggers_today`; then
+   `GET /observe/nrs?market=stock&section=triggers&since=09:30` -> pick a row, e.g. `IOVA` long, breakout
+   11.01, `triggered_at_et` `2026-10-29 09:30`.
+2. `GET /observe/bars` -> check `IOVA` is in `symbols` and `data_stale` is false.
+3. Quiz (before the trigger): `GET /observe/bars?symbol=IOVA&tf=5m&day=prev_weekday` (yesterday's context) and
+   `GET /observe/bars?symbol=IOVA&tf=2m&day=today&to=09:30` (bars up to the trigger bar). Ask: take it?
+   Entry, stop?
+4. Replay (after): `GET /observe/bars?symbol=IOVA&tf=2m&day=today&from=09:32&to=11:00` -> what happened next
+   (high/low after entry, whether the stop would have been hit). If `next_offset` is not null, call again with it.
+5. If the symbol is missing, say so; do not guess prices. Quote `latest_bar_et` for "as of".
+
 Where files live: the collector writes `/opt/stacks/bull-desk/hermes-bridge-run/observe/<name>.json`
 (dir 0755, files 0644, tmp + atomic rename). The container sees it read-only as `/run/bridge/observe`
-(`OBSERVE_DIR` overrides) through the existing `hermes-bridge-run` mount; the relay opens only the eleven
+(`OBSERVE_DIR` overrides) through the existing `hermes-bridge-run` mount; the relay opens only the twelve
 fixed file names, with `O_NOFOLLOW`, and never builds a path from request input.
 
 Kill switch (observe only; `KILL` stops everything):

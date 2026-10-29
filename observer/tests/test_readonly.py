@@ -37,7 +37,8 @@ class ReadOnly(unittest.TestCase):
         for method, url, headers, body in self.box.opener.calls:
             self.assertEqual(method, "GET", url)
             self.assertIsNone(body)
-            self.assertTrue(url.startswith(("https://paper-api.alpaca.markets/", "https://api-fxpractice.oanda.com/")))
+            self.assertTrue(url.startswith(("https://paper-api.alpaca.markets/", "https://api-fxpractice.oanda.com/",
+                                            "https://data.alpaca.markets/v2/stocks/bars?")), url)
             for s in fakes.SECRETS:
                 self.assertNotIn(s, url.replace(fakes.OANDA_ACCT, ""))  # account id is part of the OANDA path
 

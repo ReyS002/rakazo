@@ -842,7 +842,7 @@ class ObserveRouteTest(unittest.TestCase):
         self.assertEqual(self.raw_get("/observe/health?x=../secret")[0], 200)
         self.assertEqual(relay.OBSERVE_FILES, {n: n + ".json" for n in
                                                ("health", "scanner", "paper", "projects", "vault", "logs",
-                                                "narrow", "nrs", "journals", "phasec", "robinhood")})
+                                                "narrow", "nrs", "journals", "phasec", "robinhood", "bars")})
         for name in ("../secret", "secret", "Health", "", None, 5, "health/../health"):
             with self.subTest(name=name), self.assertRaises(relay.SnapshotMissing):
                 relay.read_snapshot(name, self.dir)
@@ -1120,7 +1120,7 @@ class JournalsRouteTest(unittest.TestCase):
         code, headers, body = self.q(**params)
         self.assertEqual(code, 200, body)
         self.assertEqual(headers["Cache-Control"], "no-store")
-        self.assertLessEqual(len(body), relay.JOURNALS_SLICE_MAX)
+        self.assertLessEqual(len(body), getattr(self, "max_reply", relay.JOURNALS_SLICE_MAX))
         return json.loads(body)
 
     def err(self, expect, **params):
@@ -1481,6 +1481,340 @@ class JournalsRouteTest(unittest.TestCase):
         self.assertIn("status=200 bytes=0 from=- route=observe name=journals view=slice section=decisions\n", out)
         self.assertIn("status=404 bytes=0 from=- route=observe name=journals view=slice\n", out)
         self.assertIn("status=400 bytes=0 from=- route=observe name=journals\n", out)
+
+
+def et_today_utc(hh, mm):
+    """UTC "YYYY-MM-DDTHH:MM:SSZ" of HH:MM US Eastern today (relay clock)."""
+    et_now = relay._now_et()
+    when = et_now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return when.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+NRS_REASONS = ["ATR% at 7th percentile (100 sessions)", "Bollinger width at 14th percentile",
+               "NR7 (narrowest range of last 7 sessions)", "Volume drying up (0.86x the 50-day average)",
+               "Within 0.8% of the 20-day EMA", "RS: underperforming the benchmark by 4.0% over 20d"]
+
+
+def nrs_market(market, n_watch=60, n_trig=40):
+    yesterday = (relay._now_et() - datetime.timedelta(days=1)).astimezone(datetime.timezone.utc)
+    trig = [{"symbol": f"T{i:02d}", "triggered_at": et_today_utc(9 + i // 6, (i % 6) * 10), "direction": "long",
+             "rvol": 1.5, "detail": "15m breakout above 11.01 (prior 4 bars), RVOL 1.7x, close 11.28",
+             "breakout_level": 11.01, "scan_date": "x", "account_id": "LEAKACCT", "nested": {"x": "LEAKNEST"}}
+            for i in range(n_trig - 1)]
+    trig.append({"symbol": "OLD1", "triggered_at": yesterday.strftime("%Y-%m-%dT%H:%M:%SZ"), "direction": "short"})
+    trig.sort(key=lambda r: r["triggered_at"], reverse=True)
+    watch = [{"symbol": f"W{i:02d}", "composite_score": 60.0 + i, "weekly_trend": "down", "is_nr7": True,
+              "atr_pct": 1.66, "last_price": 10.0, "velez_location": "No power location",
+              "correlation_group": f"grp-W{i:02d}", "reasons_short": NRS_REASONS} for i in range(n_watch)]
+    return {"ok": True, "reason": None, "source": f"/opt/stacks/ops-status/nrs-{market}-latest.json",
+            "file_mtime": iso_ago(600), "generated_at": iso_ago(600), "as_of": iso_ago(600), "age_s": 30,
+            "stale": False, "export_type": f"nrs_{market}_redacted", "trading_mode": "WATCH_ONLY",
+            "export_error": None, "watchlist_scan_date": "2026-10-29",
+            "counts": {"watchlist": n_watch, "recent_triggers_confirmed_unsuppressed_24_hours": n_trig},
+            "heartbeats": {f"{market}-live-poller": {"last_success_at": iso_ago(60), "detail": "ok"}},
+            "watchlist_count": n_watch, "recent_triggers_count": n_trig, "watchlist": watch,
+            "recent_triggers": trig,
+            "new_since_prev": {"watchlist": ["W00"], "recent_triggers": [{"symbol": "T00", "direction": "long"}]}}
+
+
+def nrs_data():
+    return {"markets": {"stock": nrs_market("stock"), "forex": nrs_market("forex", 15, 8),
+                        "crypto": {"ok": False, "reason": "source file not found", "stale": True}},
+            "stale": True, "prev_snapshot": True}
+
+
+class NrsRouteTest(unittest.TestCase):
+    setUp = ObserveRouteTest.setUp
+    start = ObserveRouteTest.start
+    tearDown = ObserveRouteTest.tearDown
+    call = RelayTest.call
+    put = ObserveRouteTest.put
+    ok = JournalsRouteTest.ok
+    err = JournalsRouteTest.err
+    walk = JournalsRouteTest.walk
+    route = "/observe/nrs"
+    max_reply = relay.SLICE_MAX
+
+    def q(self, key=OBS_KEY, **params):
+        return self.call(self.route + ("?" + urllib.parse.urlencode(params) if params else ""), "GET", key=key)
+
+    def put_nrs(self, data=None):
+        self.put("nrs", envelope("nrs", data=nrs_data() if data is None else data))
+
+    def test_fixture_is_bigger_than_a_slice(self):
+        self.put_nrs()
+        self.assertGreater(os.path.getsize(os.path.join(self.dir, "nrs.json")), 4 * relay.SLICE_MAX)
+
+    def test_index(self):
+        self.put_nrs()
+        code, headers, body = self.q()
+        self.assertEqual((code, headers["Cache-Control"]), (200, "no-store"))
+        self.assertLessEqual(len(body), relay.SLICE_MAX)
+        data = json.loads(body)
+        self.assertEqual((data["name"], data["ok"], data["stale"], data["exports_stale"]), ("nrs", True, False, True))
+        self.assertEqual(sorted(data["markets"]), ["crypto", "forex", "stock"])
+        self.assertEqual(data["sections"], ["summary", "recent_triggers", "watchlist", "heartbeats",
+                                            "new_since_prev"])
+        s = data["markets"]["stock"]
+        self.assertEqual((s["ok"], s["watchlist"], s["recent_triggers"], s["triggers_today"], s["stale"]),
+                         (True, 60, 40, 39, False))
+        self.assertGreaterEqual(s["age_s"], 599)
+        self.assertEqual(s["new_since_prev"], {"recent_triggers": 1, "watchlist": 1})
+        self.assertEqual(s["export_counts"]["watchlist"], 60)
+        self.assertGreater(s["bytes"]["watchlist"], relay.SLICE_MAX)  # size hint: page it
+        c = data["markets"]["crypto"]
+        self.assertEqual((c["ok"], c["reason"], c["watchlist"]), (False, "source file not found", 0))
+        for needle in ("market=", "section=", "next_offset", "since=HH:MM", "full=1"):
+            self.assertIn(needle, data["usage"])
+        for leak in (b"reasons_short", b"W05", b"LEAKACCT"):
+            self.assertNotIn(leak, body)
+        self.assertEqual(self.call("/observe/nrs?", "GET", key=OBS_KEY)[0], 200)
+
+    def test_full_snapshot_still_reachable(self):
+        self.put_nrs()
+        data = self.ok_full()
+        self.assertEqual(len(data["data"]["markets"]["stock"]["watchlist"]), 60)
+        self.assertIn("full=1 takes no other parameter", self.err(400, full="1", market="stock"))
+        self.assertEqual(self.q(full="yes")[0], 400)
+
+    def ok_full(self):
+        code, _, body = self.q(full="1")
+        self.assertEqual(code, 200)
+        return json.loads(body)
+
+    def test_summary_default_section(self):
+        self.put_nrs()
+        page = self.ok(market="stock")
+        self.assertEqual((page["section"], page["market"], page["market_stale"]), ("summary", "stock", False))
+        self.assertEqual(page["summary"]["watchlist_count"], 60)
+        self.assertEqual(page["summary"]["counts"]["watchlist"], 60)
+        for absent in ("watchlist", "recent_triggers", "heartbeats", "new_since_prev"):
+            self.assertNotIn(absent, page["summary"])
+        self.assertEqual(self.ok(market="stock", section="heartbeats")["heartbeats"]["stock-live-poller"]["detail"],
+                         "ok")
+        self.assertEqual(self.ok(market="stock", section="new_since_prev")["new_since_prev"]["watchlist"], ["W00"])
+
+    def test_walk_watchlist_and_triggers(self):
+        self.put_nrs()
+        rows, total = self.walk(market="stock", section="watchlist")
+        self.assertEqual((total, [r["symbol"] for r in rows]), (60, [f"W{i:02d}" for i in range(60)]))
+        self.assertEqual(rows[0]["reasons_short"], NRS_REASONS)
+        rows, total = self.walk(market="stock", section="triggers", limit=7)  # alias
+        self.assertEqual(total, 40)
+        stamps = [r["triggered_at"] for r in rows]
+        self.assertEqual(stamps, sorted(stamps, reverse=True))  # newest first, as stored
+        self.assertEqual(rows[-1]["symbol"], "OLD1")
+        for r in rows:
+            self.assertNotIn("account_id", r)
+            self.assertNotIn("nested", r)
+            self.assertRegex(r["triggered_at_et"], r"^\d{4}-\d\d-\d\d \d\d:\d\d$")
+        page = self.ok(market="stock", section="recent_triggers", limit=3)
+        self.assertEqual((page["returned"], page["next_offset"], page["section"]), (3, 3, "recent_triggers"))
+
+    def test_symbol_and_since_filters(self):
+        self.put_nrs()
+        page = self.ok(market="stock", section="watchlist", symbol="w07")
+        self.assertEqual(([r["symbol"] for r in page["rows"]], page["filters"]), (["W07"], {"symbol": "W07",
+                                                                                           "since": None}))
+        self.assertEqual(self.ok(market="stock", section="recent_triggers", symbol="NOPE")["total"], 0)
+        page = self.ok(market="stock", section="recent_triggers", since="14:00", limit=200)
+        self.assertTrue(page["rows"])
+        for r in page["rows"]:
+            self.assertGreaterEqual(r["triggered_at_et"][-5:], "14:00")
+            self.assertNotEqual(r["symbol"], "OLD1")  # since = today only
+        expected = sum(1 for i in range(39) if (9 + i // 6, (i % 6) * 10) >= (14, 0))
+        self.assertEqual(page["total"], expected)
+        page = self.ok(market="stock", section="recent_triggers", since="14:00", symbol="T30")
+        self.assertEqual([r["symbol"] for r in page["rows"]], ["T30"])
+
+    def test_bad_params(self):
+        self.put_nrs()
+        cases = [
+            ({"market": "bogus"}, "market must be one of"),
+            ({"market": "stock", "section": "bogus"}, "section must be one of"),
+            ({"market": "stock", "section": "watchlist", "limit": "0"}, "limit must be"),
+            ({"market": "stock", "section": "watchlist", "limit": "201"}, "limit must be"),
+            ({"market": "stock", "section": "watchlist", "offset": "-1"}, "offset must be"),
+            ({"market": "stock", "section": "watchlist", "symbol": "A B"}, "symbol must be"),
+            ({"market": "stock", "section": "recent_triggers", "since": "25:00"}, "since must be HH:MM"),
+            ({"market": "stock", "section": "watchlist", "since": "10:00"}, "since applies only"),
+            ({"market": "stock", "symbol": "W00"}, "apply only to section=recent_triggers or watchlist"),
+            ({"market": "stock", "bogus": "x"}, "unknown query parameter"),
+        ]
+        for params, needle in cases:
+            with self.subTest(params=params):
+                self.assertIn(needle, self.err(400, **params))
+        self.assertEqual(self.call("/observe/nrs?market=stock&market=forex", "GET", key=OBS_KEY)[0], 400)
+        self.assertIn("market is required; valid: stock, forex, crypto", self.err(404, section="watchlist"))
+        self.put_nrs({"markets": {"stock": nrs_market("stock")}})
+        self.assertIn("unknown market; valid: stock", self.err(404, market="forex"))
+
+    def test_every_slice_bounded_even_with_huge_rows(self):
+        data = nrs_data()
+        data["markets"]["stock"]["watchlist"] = data["markets"]["stock"]["watchlist"][:30]
+        for r in data["markets"]["stock"]["watchlist"]:
+            r["reasons_short"] = ["x" * 3000] * 2
+        self.put_nrs(data)
+        rows, total = self.walk(market="stock", section="watchlist", limit=200)  # ok() asserts <= SLICE_MAX
+        self.assertEqual((len(rows), total), (30, 30))
+
+    def test_failed_and_odd_snapshots(self):
+        self.put("nrs", envelope("nrs", ok=False, error="nrs: source missing", data={}))
+        data = json.loads(self.q()[2])
+        self.assertEqual((data["ok"], data["error"], data["markets"]), (False, "nrs: source missing", {}))
+        self.assertIn("valid: none", self.err(404, market="stock"))
+        self.put("nrs", envelope("nrs", data={"markets": {"stock": {"watchlist": "nope", "recent_triggers": [1, "x"]}}}))
+        self.assertEqual(json.loads(self.q()[2])["markets"]["stock"]["watchlist"], 0)
+        self.assertEqual(self.ok(market="stock", section="recent_triggers")["total"], 0)
+
+    def test_auth_kill_and_logs(self):
+        self.put_nrs()
+        self.assertEqual(self.q(key=None)[0], 401)
+        self.assertEqual(self.q(key="x" * 40)[0], 403)
+        open(self.kill_observe, "w").close()
+        self.assertEqual(self.q(market="stock")[0], 503)
+        os.remove(self.kill_observe)
+        self.q()
+        self.q(market="stock", section="watchlist", symbol="LEAKSYM")
+        self.q(market="stock", nope="LEAKPARAM")
+        out = self.stdout.getvalue()
+        for needle in ("LEAK", OBS_KEY):
+            self.assertNotIn(needle, out)
+        self.assertIn("route=observe name=nrs view=index\n", out)
+        self.assertIn("route=observe name=nrs view=slice section=watchlist\n", out)
+
+
+BARS_SYMBOLS = [f"S{chr(65 + i // 26)}{chr(65 + i % 26)}" for i in range(40)]
+
+
+def bar_rows(step):
+    rows, t = [], 9 * 60 + 30
+    while t < 16 * 60:
+        rows.append(["%02d:%02d" % divmod(t, 60), 101.25, 101.75, 100.5, 101.5, 123456])
+        t += step
+    return rows
+
+
+def bars_data(symbols=BARS_SYMBOLS):
+    day = {"2m": bar_rows(2), "5m": bar_rows(5)}
+    return {"source": "alpaca market data GET /v2/stocks/bars", "feed": "iex", "as_of": iso_ago(60),
+            "stale": False, "error": None, "inputs": {"nrs": "ok", "scanner": "ok", "journals": "ok"},
+            "timeframes": ["2m", "5m"],
+            "days": {"today": {"date": "2026-10-29", "session": "closed"},
+                     "prev_weekday": {"date": "2026-10-28", "session": "closed"}},
+            "symbols": list(symbols), "symbol_sources": {s: ["nrs"] for s in symbols},
+            "dropped_for_cap": ["ZZZ"], "dropped_for_size": [], "latest_bar_et": "2026-10-29 15:58",
+            "bar_format": ["t_et", "o", "h", "l", "c", "v"],
+            "counts": {s: {"today": {"2m": 195, "5m": 78}, "prev_weekday": {"2m": 195, "5m": 78}} for s in symbols},
+            "bars": {s: {"today": day, "prev_weekday": day} for s in symbols}}
+
+
+class BarsRouteTest(unittest.TestCase):
+    setUp = ObserveRouteTest.setUp
+    start = ObserveRouteTest.start
+    tearDown = ObserveRouteTest.tearDown
+    call = RelayTest.call
+    put = ObserveRouteTest.put
+    ok = JournalsRouteTest.ok
+    err = JournalsRouteTest.err
+    walk = JournalsRouteTest.walk
+    q = NrsRouteTest.q
+    route = "/observe/bars"
+    max_reply = relay.SLICE_MAX
+
+    def put_bars(self, data=None, **over):
+        self.put("bars", envelope("bars", data=bars_data() if data is None else data, **over))
+
+    def test_fixture_is_big(self):
+        self.put_bars()
+        size = os.path.getsize(os.path.join(self.dir, "bars.json"))
+        self.assertGreater(size, relay.MAX_SNAPSHOT_FILE)  # served only because bars has its own cap
+        self.assertLessEqual(size, relay.SNAPSHOT_MAX_BYTES["bars"])
+
+    def test_bars_index(self):
+        self.put_bars()
+        code, headers, body = self.q()
+        self.assertEqual((code, headers["Cache-Control"]), (200, "no-store"))
+        self.assertLessEqual(len(body), relay.SLICE_MAX)
+        data = json.loads(body)
+        self.assertEqual((data["name"], data["ok"], data["feed"], data["data_stale"], data["timeframes"]),
+                         ("bars", True, "iex", False, ["2m", "5m"]))
+        self.assertEqual(data["symbols"], BARS_SYMBOLS)
+        self.assertEqual(data["counts"]["SAA"], {"today": {"2m": 195, "5m": 78}, "prev_weekday": {"2m": 195, "5m": 78}})
+        self.assertEqual(data["days"]["prev_weekday"], {"date": "2026-10-28", "session": "closed"})
+        self.assertEqual(data["dropped_for_cap"], ["ZZZ"])
+        for needle in ("symbol=", "tf=2m|5m", "from=HH:MM", "next_offset"):
+            self.assertIn(needle, data["usage"])
+        self.assertNotIn(b"123456", body)
+
+    def test_bars_slice_walk(self):
+        self.put_bars()
+        page = self.ok(symbol="saa", tf="2m", day="prev_weekday")
+        self.assertEqual((page["symbol"], page["tf"], page["day"], page["day_key"], page["feed"]),
+                         ("SAA", "2m", "2026-10-28", "prev_weekday", "iex"))
+        self.assertEqual(page["rows"][0], ["09:30", 101.25, 101.75, 100.5, 101.5, 123456])
+        self.assertEqual((page["returned"], page["next_offset"]), (195, None))  # a full 2m day fits in 12 KB
+        page = self.ok(symbol="SAA", tf="2m", day="prev_weekday", limit=50, offset=150)
+        self.assertEqual((page["returned"], page["next_offset"], page["rows"][0][0]), (45, None, "14:30"))
+        rows, total = self.walk(symbol="SAA", tf="2m", day="2026-10-28", limit=400)
+        self.assertEqual((len(rows), total, rows[-1][0]), (195, 195, "15:58"))
+        page = self.ok(symbol="SAA")  # defaults: 5m, today
+        self.assertEqual((page["tf"], page["day_key"], page["total"]), ("5m", "today", 78))
+
+    def test_bars_time_window(self):
+        self.put_bars()
+        page = self.ok(symbol="SAA", tf="5m", **{"from": "10:00", "to": "10:30"})
+        self.assertEqual([r[0] for r in page["rows"]], ["10:00", "10:05", "10:10", "10:15", "10:20", "10:25",
+                                                       "10:30"])
+        self.assertEqual(page["filters"], {"from": "10:00", "to": "10:30"})
+        self.assertEqual(self.ok(symbol="SAA", tf="5m", **{"from": "15:55"})["total"], 1)
+
+    def test_bars_bad_params(self):
+        self.put_bars()
+        cases = [({"symbol": "SAA", "tf": "1m"}, 400, "tf must be one of"),
+                 ({"symbol": "S A"}, 400, "symbol must be"),
+                 ({"symbol": "SAA", "day": "yesterday"}, 400, "day must be"),
+                 ({"symbol": "SAA", "from": "9:30"}, 400, "from must be HH:MM"),
+                 ({"symbol": "SAA", "from": "11:00", "to": "10:00"}, 400, "from must be <= to"),
+                 ({"symbol": "SAA", "limit": "401"}, 400, "limit must be"),
+                 ({"symbol": "SAA", "full": "1"}, 400, "unknown query parameter"),
+                 ({"symbol": "NOPE"}, 404, "unknown symbol; valid: SAA, SAB"),
+                 ({"tf": "2m"}, 404, "symbol is required"),
+                 ({"symbol": "SAA", "day": "2020-01-01"}, 404, "unknown day; valid: today, prev_weekday")]
+        for params, status, needle in cases:
+            with self.subTest(params=params):
+                self.assertIn(needle, self.err(status, **params))
+
+    def test_bars_failed_snapshot(self):
+        data = bars_data([])
+        data.update(stale=True, error="today 2m: HttpError (HTTP 500)", bars={}, counts={}, feed=None)
+        self.put_bars(data, ok=False, error="today 2m: HttpError (HTTP 500)")
+        index = json.loads(self.q()[2])
+        self.assertEqual((index["ok"], index["error"], index["data_stale"], index["symbols"]),
+                         (False, "today 2m: HttpError (HTTP 500)", True, []))
+        self.assertIn("valid: none", self.err(404, symbol="SAA"))
+        self.put("bars", "{not json")
+        self.assertEqual(self.q()[0], 502)
+
+    def test_bars_auth_kill_and_logs(self):
+        self.put_bars()
+        self.assertEqual(self.q(key=None)[0], 401)
+        open(self.kill, "w").close()
+        self.assertEqual(self.q(symbol="SAA")[0], 503)
+        os.remove(self.kill)
+        self.q(symbol="SAA", tf="2m")
+        self.q(symbol="LEAKSYM")
+        out = self.stdout.getvalue()
+        self.assertNotIn("LEAK", out)
+        self.assertIn("route=observe name=bars view=slice tf=2m\n", out)
+
+    def test_bars_rate_limit_shared_with_observe(self):
+        self.start(self.env, observe_limiter=relay.make_observe_limiter())
+        self.put_bars()
+        for i in range(relay.OBSERVE_PER_MINUTE):
+            self.assertEqual(self.q(symbol="SAA", limit=1)[0], 200, i)
+        code, headers, _ = self.q()
+        self.assertEqual((code, headers["Cache-Control"]), (429, "no-store"))
 
 
 class StartupTest(unittest.TestCase):

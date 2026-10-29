@@ -1,0 +1,16 @@
+# EXAMPLE ONLY - not installed.
+# Every 5 min 09:30-16:25 ET on weekdays (the 16:05 run has the 15:55 5m bar), plus once after boot so the
+# previous session is there before the open. Verify before enabling:
+#   systemd-analyze calendar --iterations=4 'Mon..Fri 09:30/5 America/New_York'
+[Unit]
+Description=Bull Desk oversight collector every 5 min in the regular session (bars)
+
+[Timer]
+OnCalendar=Mon..Fri 09:30/5 America/New_York
+OnCalendar=Mon..Fri 10..15:00/5 America/New_York
+OnCalendar=Mon..Fri 16:00,05,10,15,20,25 America/New_York
+OnBootSec=3min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

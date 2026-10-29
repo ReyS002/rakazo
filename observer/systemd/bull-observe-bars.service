@@ -1,0 +1,20 @@
+# EXAMPLE ONLY - not installed. bars (GET-only HTTPS to data.alpaca.markets/v2/stocks/bars; reads nrs.json,
+# scanner.json and journals.json from the output dir for the symbol list; paper key from the stack .env files).
+[Unit]
+Description=Bull Desk oversight collector (intraday stock bars)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 -I /opt/stacks/bull-desk/observer/collect.py --only bars --once
+TimeoutStartSec=90
+Nice=10
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/stacks/bull-desk/hermes-bridge-run/observe
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

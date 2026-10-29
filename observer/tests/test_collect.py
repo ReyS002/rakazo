@@ -10,7 +10,8 @@ import collect
 import deps as d
 import scrub
 
-NAMES = ["health", "scanner", "paper", "projects", "vault", "logs", "narrow", "nrs", "journals", "phasec", "robinhood"]
+NAMES = ["health", "scanner", "paper", "projects", "vault", "logs", "narrow", "nrs", "journals", "phasec", "robinhood",
+         "bars"]
 EXPECTED = {n: "ok" for n in NAMES} | {"robinhood": "error"}  # robinhood: positions need the bridge key -> ok:false
 
 

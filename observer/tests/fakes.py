@@ -559,12 +559,49 @@ def oanda_payload(path):
     raise AssertionError(path)
 
 
+BARS_PAGE = 500  # fake page size (bars across all symbols) so paging is exercised
+
+
+def _fake_bar(sym, when, i):
+    base = 100.0 + (sum(map(ord, sym)) % 50) + i * 0.01
+    return {"t": when.strftime("%Y-%m-%dT%H:%M:%SZ"), "o": base, "h": base + 0.5, "l": base - 0.5,
+            "c": base + 0.1, "v": 1000 + i, "n": 10, "vw": base}
+
+
+def bars_payload(query, sip="refuse"):
+    """Fake /v2/stocks/bars: every symbol gets one bar per timeframe step from start-60min to end+60min (so
+    extended-hours bars must be filtered), paged BARS_PAGE bars at a time. sip="refuse" -> HTTP 403 for feed=sip."""
+    import urllib.parse
+    from datetime import datetime, timedelta
+    q = dict(urllib.parse.parse_qsl(query))
+    if q.get("feed") == "sip" and sip == "refuse":
+        return 403, {"message": "subscription does not permit querying recent SIP data"}
+    step = int(q["timeframe"].rstrip("Min"))
+    start = datetime.fromisoformat(q["start"].replace("Z", "+00:00")) - timedelta(minutes=60)
+    end = datetime.fromisoformat(q["end"].replace("Z", "+00:00")) + timedelta(minutes=60)
+    flat = []
+    for sym in q["symbols"].split(","):
+        t, i = start, 0
+        while t < end:
+            flat.append((sym, _fake_bar(sym, t, i)))
+            t += timedelta(minutes=step)
+            i += 1
+    off = int(q.get("page_token", "0"))
+    page = flat[off:off + BARS_PAGE]
+    out = {}
+    for sym, b in page:
+        out.setdefault(sym, []).append(b)
+    nxt = off + BARS_PAGE
+    return 200, {"bars": out, "next_page_token": str(nxt) if nxt < len(flat) else None}
+
+
 class FakeOpener:
     """Stands in for the urllib opener; records (method, url, headers)."""
 
-    def __init__(self, fail_substr=()):
+    def __init__(self, fail_substr=(), sip="refuse"):
         self.calls = []
         self.fail_substr = tuple(fail_substr)
+        self.sip = sip
 
     def open(self, req, timeout=None):
         import urllib.parse
@@ -578,6 +615,10 @@ class FakeOpener:
             body = alpaca_payload(parts.path, req.get_header("Apca-api-key-id"))
         elif parts.hostname == "api-fxpractice.oanda.com":
             body = oanda_payload(parts.path)
+        elif parts.hostname == "data.alpaca.markets" and parts.path == "/v2/stocks/bars":
+            code, body = bars_payload(parts.query, self.sip)
+            if code != 200:
+                raise urllib.error.HTTPError(url, code, "refused", {}, io.BytesIO(json.dumps(body).encode()))
         else:
             raise AssertionError(f"unexpected host {url}")
         return _Resp(json.dumps(body).encode())

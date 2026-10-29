@@ -11,8 +11,9 @@ GET /results (same TASK_KEYS) serves the sanitized status files Hermes publishes
 into RESULTS_DIR (read-only mount); it never touches anything else.
 GET /observe[/<name>] (enabled only when OBS_KEYS is set) serves the oversight
 snapshots a host-side collector writes into OBSERVE_DIR (read-only mount); only
-the allowlisted file names are ever opened. /observe/journals is never served whole: no query -> a compact
-index, ?day=&bot=&section=... -> one bounded page of one bot's list.
+the allowlisted file names are ever opened. /observe/journals, /observe/nrs and /observe/bars are sliced: no query
+-> a compact index, query -> one bounded page (journals: one bot's list; nrs: one market's section, ?full=1 the
+whole ~40 KB snapshot; bars: one symbol/timeframe/day).
 """
 
 import collections
@@ -57,13 +58,14 @@ RESULT_FILE_RE = re.compile(r"(bd-[0-9]{8}-[0-9]{6}-[0-9a-f]{4})\.json")
 KILL_OBSERVE_FILE = "/run/bridge/KILL_OBSERVE"
 OBSERVE_DIR = os.environ.get("OBSERVE_DIR", "/run/bridge/observe")
 OBSERVE_NAMES = ("health", "scanner", "paper", "projects", "vault", "logs", "narrow", "nrs", "journals", "phasec",
-                 "robinhood")
+                 "robinhood", "bars")
 OBSERVE_FILES = {name: name + ".json" for name in OBSERVE_NAMES}  # the only paths ever opened
 OBSERVE_ENVELOPE = ("name", "generated_at", "ok", "error", "data")
 OBSERVE_PER_MINUTE = 60
 OBSERVE_STALE_S = 600
 MAX_SNAPSHOT_FILE = 256 * 1024
-SNAPSHOT_MAX_BYTES = {"journals": 8 << 20}  # journals is never served whole: see journals_index/journals_slice
+# journals and bars are never served whole: see journals_index/journals_slice, bars_index/bars_slice
+SNAPSHOT_MAX_BYTES = {"journals": 8 << 20, "bars": 2 << 20}  # bars: parsed ~7x its size; container has 64 MB
 JOURNALS_PER_MINUTE = 120                   # own limiter for /observe/journals (index + slices)
 JOURNALS_INDEX_MAX = 20 * 1024
 JOURNALS_SLICE_MAX = 40 * 1024
@@ -96,6 +98,35 @@ JOURNALS_USAGE = (
     "status filters passed vs every other decision. Rows are in time order; `time` is UTC, `time_et` the ET clock. "
     "truncated_at_source=true means the "
     "collector kept fewer rows than the export had."
+)
+SLICE_MAX = 12 * 1024                       # /observe/nrs and /observe/bars replies (index and slices)
+_SYMBOL_RE = re.compile(r"[A-Za-z0-9._/-]{1,20}")
+NRS_MARKETS = ("stock", "forex", "crypto")
+NRS_SECTIONS = ("summary", "recent_triggers", "watchlist", "heartbeats", "new_since_prev")
+NRS_LISTS = ("recent_triggers", "watchlist")
+NRS_ALIASES = {"triggers": "recent_triggers"}
+NRS_PARAMS = ("market", "section", "offset", "limit", "symbol", "since", "full")
+NRS_LIMIT_DEFAULT = 50
+NRS_LIMIT_MAX = 200
+NRS_USAGE = (
+    "GET /observe/nrs?market=<stock|forex|crypto>[&section=<section>][&offset=N][&limit=N][&symbol=SYM]"
+    "[&since=HH:MM]. section: summary (default), recent_triggers (alias triggers), watchlist, heartbeats, "
+    "new_since_prev. offset >= 0, limit 1..200 (default 50); a reply is capped at 12 KB, so keep calling with "
+    "offset=next_offset until next_offset is null. symbol= (exact, any case) filters recent_triggers and watchlist; "
+    "since=HH:MM keeps recent_triggers fired today (ET) at or after that ET time. Triggers are newest first; "
+    "`triggered_at` is UTC, `triggered_at_et` the ET date and clock. ?full=1 returns the whole snapshot (~40 KB)."
+)
+BARS_TFS = ("2m", "5m")
+BARS_DAY_KEYS = ("today", "prev_weekday")
+BARS_PARAMS = ("symbol", "tf", "day", "from", "to", "offset", "limit")
+BARS_LIMIT_DEFAULT = 200
+BARS_LIMIT_MAX = 400
+BARS_USAGE = (
+    "GET /observe/bars?symbol=SYM[&tf=2m|5m][&day=today|prev_weekday|YYYY-MM-DD][&from=HH:MM][&to=HH:MM]"
+    "[&offset=N][&limit=N]. Defaults: tf=5m, day=today. Regular session only (09:30-16:00 ET). Each row is "
+    "[t_et, open, high, low, close, volume]; t_et is the ET bar start. from/to are inclusive ET bar starts. "
+    "offset >= 0, limit 1..400 (default 200); a reply is capped at 12 KB, so keep calling with "
+    "offset=next_offset until next_offset is null."
 )
 
 # C0/C1 controls except "\n", plus bidi overrides that can spoof rendered text.
@@ -392,6 +423,10 @@ def observe_index(observe_dir=None, now=None):
     return out
 
 
+def _head(name, env):
+    return {"name": name, "generated_at": env["generated_at"], "age_s": env["age_s"], "stale": env["stale"]}
+
+
 # ── /observe/journals: compact index + bounded slices ────────────────────
 
 def _nth_sunday(year, month, n):
@@ -522,10 +557,6 @@ def _catalog_bot(bot):
     return out
 
 
-def _envelope_head(env):
-    return {"name": "journals", "generated_at": env["generated_at"], "age_s": env["age_s"], "stale": env["stale"]}
-
-
 def journals_index(env):
     """Compact (< JOURNALS_INDEX_MAX) map of the journals snapshot: what exists, how many rows, how to slice."""
     data = env["data"] if isinstance(env["data"], dict) else {}
@@ -534,7 +565,7 @@ def journals_index(env):
         catalog[key] = {"date": date, "bots": [_catalog_bot(b) for b in journal_bots(day)]}
         if isinstance(day.get("missing"), list):
             missing += [m[:200] for m in day["missing"][:10] if isinstance(m, str)]
-    body = {"ok": env["ok"], **_envelope_head(env), "error": env["error"],
+    body = {"ok": env["ok"], **_head("journals", env), "error": env["error"],
             "exports_stale": data.get("stale") if isinstance(data.get("stale"), bool) else None,
             "missing": missing, "catalog": catalog, "usage": JOURNALS_USAGE}
     while len(json.dumps(body)) > JOURNALS_INDEX_MAX:
@@ -549,25 +580,73 @@ def journals_index(env):
     return body
 
 
-class JournalsError(Exception):
+class SliceError(Exception):
     def __init__(self, status, message):
         super().__init__(message)
         self.status = status
         self.message = message
 
 
+JournalsError = SliceError
+
+
+def _query_params(query, allowed):
+    """{name: value} from a raw query string (each allowed name at most once); raises SliceError(400).
+    Never echoes input back in the message."""
+    try:
+        params = urllib.parse.parse_qs(query, keep_blank_values=True, max_num_fields=len(allowed))
+    except ValueError:
+        raise SliceError(400, "too many query parameters") from None
+    if any(name not in allowed for name in params):
+        raise SliceError(400, "unknown query parameter; allowed: " + ", ".join(allowed))
+    if any(len(values) != 1 for values in params.values()):
+        raise SliceError(400, "each query parameter may appear only once")
+    return {name: values[0] for name, values in params.items()}
+
+
+def _paging(p, out, limit_max):
+    """offset/limit from p into out (defaults already in out); raises SliceError(400)."""
+    for name, low, high in (("offset", 0, None), ("limit", 1, limit_max)):
+        if name in p:
+            value = p[name]
+            if not _INT_RE.fullmatch(value) or int(value) < low or (high is not None and int(value) > high):
+                raise SliceError(400, f"{name} must be an integer >= {low}" + (f" and <= {high}" if high else ""))
+            out[name] = int(value)
+
+
+def _hhmm(p, name):
+    m = _HHMM_RE.fullmatch(p[name])
+    if m is None:
+        raise SliceError(400, f"{name} must be HH:MM (24h, ET)")
+    return int(m.group(1)), int(m.group(2))
+
+
+def _page(body, rows, offset, limit, max_bytes, encode=lambda r: r):
+    """Fill body with one page of rows (total/offset/limit/returned/next_offset/rows) whose JSON stays <= max_bytes.
+    Always returns at least one row when one exists at offset."""
+    total = len(rows)
+    body.update(total=total, offset=offset, limit=limit, returned=0, next_offset=10 ** 9, rows=[])
+    budget = max_bytes - len(json.dumps(body))
+    page = []
+    for row in rows[offset:offset + limit]:
+        row = encode(row)
+        cost = len(json.dumps(row)) + 2
+        if page and cost > budget:
+            break
+        page.append(row)
+        budget -= cost
+    body.update(rows=page, returned=len(page),
+                next_offset=offset + len(page) if offset + len(page) < total and page else None)
+    while len(json.dumps(body)) > max_bytes and len(page) > 1:  # belt and braces
+        page.pop()
+        body.update(returned=len(page), next_offset=offset + len(page))
+    return body
+
+
 def parse_journals_query(query):
     """Validated slice parameters from a raw query string; raises JournalsError(400) on any bad input.
     Never echoes input back in the message."""
-    try:
-        params = urllib.parse.parse_qs(query, keep_blank_values=True, max_num_fields=len(JOURNALS_PARAMS))
-    except ValueError:
-        raise JournalsError(400, "too many query parameters") from None
-    if any(name not in JOURNALS_PARAMS for name in params):
-        raise JournalsError(400, "unknown query parameter; allowed: " + ", ".join(JOURNALS_PARAMS))
-    if any(len(values) != 1 for values in params.values()):
-        raise JournalsError(400, "each query parameter may appear only once")
-    p = {name: values[0] for name, values in params.items()}
+    p = _query_params(query, JOURNALS_PARAMS)
     out = {"offset": 0, "limit": JOURNALS_LIMIT_DEFAULT, "before": None, "after": None, "status": "all"}
     day = p.get("day")
     if day is not None and day not in JOURNALS_DAY_KEYS and not _DATE_RE.fullmatch(day):
@@ -579,18 +658,10 @@ def parse_journals_query(query):
     if section is not None and not _SECTION_RE.fullmatch(section):
         raise JournalsError(400, "section must be one of: " + ", ".join(JOURNALS_SECTIONS))
     out.update(day=day, bot=bot, section=section)
-    for name, low, high in (("offset", 0, None), ("limit", 1, JOURNALS_LIMIT_MAX)):
-        if name in p:
-            value = p[name]
-            if not _INT_RE.fullmatch(value) or int(value) < low or (high is not None and int(value) > high):
-                raise JournalsError(400, f"{name} must be an integer >= {low}" + (f" and <= {high}" if high else ""))
-            out[name] = int(value)
+    _paging(p, out, JOURNALS_LIMIT_MAX)
     for name in ("before", "after"):
         if name in p:
-            m = _HHMM_RE.fullmatch(p[name])
-            if m is None:
-                raise JournalsError(400, f"{name} must be HH:MM (24h, ET)")
-            out[name] = (int(m.group(1)), int(m.group(2)))
+            out[name] = _hhmm(p, name)
     if "status" in p:
         if p["status"] not in JOURNALS_STATUS:
             raise JournalsError(400, "status must be one of: " + ", ".join(JOURNALS_STATUS))
@@ -646,29 +717,260 @@ def journals_slice(env, q):
     if rows is None:
         source = "paper-fills export" if q["section"] in _PAPER_LISTS else "decisions export"
         raise JournalsError(404, f"no {source} with {q['section']} for {bot['label']} on {date}")
-    rows = _select_rows(rows, q)
-    total, offset = len(rows), q["offset"]
-    body = {"ok": True, **_envelope_head(env), "day": date, "day_key": key,
+    body = {"ok": True, **_head("journals", env), "day": date, "day_key": key,
             "bot": {"label": bot["label"], "code": bot["code"]}, "section": q["section"],
             "filters": {"before": "%02d:%02d" % q["before"] if q["before"] else None,
                         "after": "%02d:%02d" % q["after"] if q["after"] else None, "status": q["status"]},
-            "total": total, "offset": offset, "limit": q["limit"], "returned": 0,
-            "next_offset": 10 ** 9, "truncated_at_source": _truncated(bot, q["section"]), "rows": []}
-    budget = JOURNALS_SLICE_MAX - len(json.dumps(body))
-    page = []
-    for row in rows[offset:offset + q["limit"]]:
-        row = _out_row(row)
-        cost = len(json.dumps(row)) + 2
-        if page and cost > budget:
-            break
-        page.append(row)
-        budget -= cost
-    body.update(rows=page, returned=len(page),
-                next_offset=offset + len(page) if offset + len(page) < total and page else None)
-    while len(json.dumps(body)) > JOURNALS_SLICE_MAX and len(page) > 1:  # belt and braces
-        page.pop()
-        body.update(returned=len(page), next_offset=offset + len(page))
+            "truncated_at_source": _truncated(bot, q["section"])}
+    return _page(body, _select_rows(rows, q), q["offset"], q["limit"], JOURNALS_SLICE_MAX, _out_row)
+
+
+# ── /observe/nrs: compact index + bounded slices ─────────────────────────
+
+def _et_stamp(value):
+    """ET datetime of a collector timestamp ("YYYY-MM-DDTHH:MM:SSZ"), else None."""
+    return _row_et({"time": value})
+
+
+def _now_et(now=None):
+    return utc_to_et(datetime.datetime.fromtimestamp(time.time() if now is None else now, datetime.timezone.utc))
+
+
+def _scalar(v):
+    return v is None or isinstance(v, (str, int, float, bool))
+
+
+def _nrs_row(row):
+    """A watchlist/trigger row as served: scalars and short scalar lists only, no id/account/key-like fields,
+    plus triggered_at_et ("YYYY-MM-DD HH:MM" ET) for triggers."""
+    out = {k: v for k, v in row.items() if isinstance(k, str) and not _ROW_DENY_RE.search(k)
+           and (_scalar(v) or (isinstance(v, list) and all(_scalar(x) for x in v)))}
+    when = _et_stamp(row.get("triggered_at"))
+    if when is not None:
+        out["triggered_at_et"] = when.strftime("%Y-%m-%d %H:%M")
+    return out
+
+
+def _nrs_markets(env):
+    data = env["data"] if isinstance(env["data"], dict) else {}
+    markets = data.get("markets") if isinstance(data.get("markets"), dict) else {}
+    return {m: markets[m] for m in NRS_MARKETS if isinstance(markets.get(m), dict)}
+
+
+def _nrs_today(rows, today):
+    return [r for r in rows if (when := _et_stamp(r.get("triggered_at"))) is not None and when.date() == today]
+
+
+def _int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def nrs_index(env, now=None):
+    """Compact (<= SLICE_MAX) map of the nrs snapshot: markets present, counts, freshness, section sizes."""
+    now = time.time() if now is None else now
+    today = _now_et(now).date()
+    data = env["data"] if isinstance(env["data"], dict) else {}
+    markets = {}
+    for m, v in _nrs_markets(env).items():
+        lists = {s: _list(v.get(s)) or [] for s in NRS_LISTS}
+        as_of = v.get("as_of")
+        try:
+            age = max(0, int(now - _parse_utc(as_of))) if as_of else None
+        except SnapshotBad:
+            age = None
+        nsp = v.get("new_since_prev") if isinstance(v.get("new_since_prev"), dict) else None
+        counts = v.get("counts") if isinstance(v.get("counts"), dict) else {}
+        markets[m] = {
+            "ok": v.get("ok") is True, "reason": v.get("reason") if isinstance(v.get("reason"), str) else None,
+            "as_of": as_of if isinstance(as_of, str) else None, "age_s": age,
+            "stale": v.get("stale") if isinstance(v.get("stale"), bool) else True,
+            "export_error": v.get("export_error") if isinstance(v.get("export_error"), str) else None,
+            "watchlist_scan_date": v.get("watchlist_scan_date") if isinstance(v.get("watchlist_scan_date"), str)
+            else None,
+            "recent_triggers": len(lists["recent_triggers"]), "triggers_today": len(_nrs_today(lists["recent_triggers"],
+                                                                                              today)),
+            "watchlist": len(lists["watchlist"]),
+            "export_counts": {k[:60]: _int(c) for k, c in list(counts.items())[:10] if isinstance(k, str)},
+            "new_since_prev": {s: len(nsp[s]) if isinstance(nsp.get(s), list) else None for s in NRS_LISTS}
+            if nsp else None,
+            "bytes": {s: len(json.dumps(v.get(s))) for s in NRS_SECTIONS if s != "summary"},
+        }
+    body = {"ok": env["ok"], **_head("nrs", env), "error": env["error"],
+            "exports_stale": data.get("stale") if isinstance(data.get("stale"), bool) else None,
+            "today_et": today.isoformat(), "markets": markets, "sections": list(NRS_SECTIONS),
+            "slice_max_bytes": SLICE_MAX, "usage": NRS_USAGE}
+    while len(json.dumps(body)) > SLICE_MAX and any(m["export_counts"] for m in markets.values()):
+        for m in markets.values():
+            m["export_counts"] = {}
     return body
+
+
+def parse_nrs_query(query):
+    """Validated nrs slice parameters; raises SliceError(400). {"full": True} for ?full=1."""
+    p = _query_params(query, NRS_PARAMS)
+    if "full" in p:
+        if p["full"] != "1" or len(p) != 1:
+            raise SliceError(400, "full=1 takes no other parameter")
+        return {"full": True}
+    out = {"full": False, "offset": 0, "limit": NRS_LIMIT_DEFAULT, "symbol": None, "since": None}
+    market = p.get("market")
+    if market is not None and market not in NRS_MARKETS:
+        raise SliceError(400, "market must be one of: " + ", ".join(NRS_MARKETS))
+    section = NRS_ALIASES.get(p.get("section"), p.get("section") or "summary")
+    if section not in NRS_SECTIONS:
+        raise SliceError(400, "section must be one of: " + ", ".join(NRS_SECTIONS) + " (triggers = recent_triggers)")
+    out.update(market=market, section=section)
+    _paging(p, out, NRS_LIMIT_MAX)
+    if "symbol" in p:
+        if not _SYMBOL_RE.fullmatch(p["symbol"]):
+            raise SliceError(400, "symbol must be 1-20 of letters, digits . _ / -")
+        out["symbol"] = p["symbol"].upper()
+    if "since" in p:
+        out["since"] = _hhmm(p, "since")
+    if section not in NRS_LISTS and any(n in p for n in ("offset", "limit", "symbol")):
+        raise SliceError(400, "offset, limit and symbol apply only to section=recent_triggers or watchlist")
+    if section != "recent_triggers" and "since" in p:
+        raise SliceError(400, "since applies only to section=recent_triggers")
+    return out
+
+
+def nrs_slice(env, q, now=None):
+    """One market's section; lists are paged and the encoded reply stays <= SLICE_MAX."""
+    markets = _nrs_markets(env)
+    if q["market"] not in markets:
+        raise SliceError(404, ("unknown market" if q["market"] else "market is required")
+                         + "; valid: " + (", ".join(markets) or "none"))
+    m, section = markets[q["market"]], q["section"]
+    body = {"ok": True, **_head("nrs", env), "market": q["market"], "section": section,
+            "as_of": m.get("as_of"), "market_stale": m.get("stale") if isinstance(m.get("stale"), bool) else True}
+    if section == "summary":
+        body["summary"] = {k: v for k, v in m.items() if k not in NRS_SECTIONS
+                           and (_scalar(v) or k == "counts" and isinstance(v, dict))}
+        return body
+    if section in ("heartbeats", "new_since_prev"):
+        value = m.get(section) if isinstance(m.get(section), dict) else None
+        body[section] = value
+        if value and len(json.dumps(body)) > SLICE_MAX:  # bounded at the collector; trim anyway, never overflow
+            body[section] = {k: v[:20] if isinstance(v, list) else v for k, v in value.items()}
+            body["truncated"] = True
+        return body
+    rows = _list(m.get(section)) or []
+    if q["symbol"]:
+        rows = [r for r in rows if isinstance(r.get("symbol"), str) and r["symbol"].upper() == q["symbol"]]
+    if q["since"]:
+        today, since = _now_et(now).date(), q["since"] + (0,)
+        kept = []
+        for r in rows:
+            when = _et_stamp(r.get("triggered_at"))
+            if when is not None and when.date() == today and (when.hour, when.minute, when.second) >= since:
+                kept.append(r)
+        rows = kept
+    body["filters"] = {"symbol": q["symbol"], "since": "%02d:%02d" % q["since"] if q["since"] else None}
+    return _page(body, rows, q["offset"], q["limit"], SLICE_MAX, _nrs_row)
+
+
+# ── /observe/bars: compact index + bounded slices ────────────────────────
+
+def _bars_days(data):
+    days = data.get("days") if isinstance(data.get("days"), dict) else {}
+    out = {}
+    for key in BARS_DAY_KEYS:
+        d = days.get(key)
+        if isinstance(d, dict) and isinstance(d.get("date"), str) and _DATE_RE.fullmatch(d["date"]):
+            out[key] = d
+    return out
+
+
+def _bars_symbols(data):
+    bars = data.get("bars") if isinstance(data.get("bars"), dict) else {}
+    return {s: v for s, v in bars.items() if isinstance(s, str) and _SYMBOL_RE.fullmatch(s) and isinstance(v, dict)}
+
+
+def _bar_rows(value):
+    return [r for r in value if isinstance(r, list) and len(r) == 6 and isinstance(r[0], str)
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in r[1:])] \
+        if isinstance(value, list) else []
+
+
+def bars_index(env):
+    """Compact (<= SLICE_MAX) map of the bars snapshot: symbols, timeframes, days, per-symbol bar counts."""
+    data = env["data"] if isinstance(env["data"], dict) else {}
+    days = _bars_days(data)
+    counts = {s: {k: {tf: len(_bar_rows((v.get(k) or {}).get(tf))) for tf in BARS_TFS} for k in days}
+              for s, v in _bars_symbols(data).items()}
+
+    def strs(key, n=60):
+        v = data.get(key)
+        return [x for x in v if isinstance(x, str)][:n] if isinstance(v, list) else []
+
+    body = {"ok": env["ok"], **_head("bars", env), "error": env["error"],
+            "source": data.get("source") if isinstance(data.get("source"), str) else None,
+            "feed": data.get("feed") if isinstance(data.get("feed"), str) else None,
+            "as_of": data.get("as_of") if isinstance(data.get("as_of"), str) else None,
+            "data_stale": data.get("stale") if isinstance(data.get("stale"), bool) else True,
+            "latest_bar_et": data.get("latest_bar_et") if isinstance(data.get("latest_bar_et"), str) else None,
+            "timeframes": list(BARS_TFS),
+            "days": {k: {"date": d["date"], "session": d.get("session") if isinstance(d.get("session"), str)
+                         else None} for k, d in days.items()},
+            "symbols": list(counts), "counts": counts,
+            "dropped_for_cap": strs("dropped_for_cap"), "dropped_for_size": strs("dropped_for_size"),
+            "bar_format": ["t_et", "o", "h", "l", "c", "v"], "slice_max_bytes": SLICE_MAX, "usage": BARS_USAGE}
+    while len(json.dumps(body)) > SLICE_MAX and body["counts"]:
+        body["counts"] = {}  # symbols list still says what exists; a slice reports its own total
+        body["counts_omitted"] = True
+    return body
+
+
+def parse_bars_query(query):
+    """Validated bars slice parameters; raises SliceError(400)."""
+    p = _query_params(query, BARS_PARAMS)
+    out = {"offset": 0, "limit": BARS_LIMIT_DEFAULT, "from": None, "to": None}
+    symbol = p.get("symbol")
+    if symbol is not None and not _SYMBOL_RE.fullmatch(symbol):
+        raise SliceError(400, "symbol must be 1-20 of letters, digits . _ / -")
+    tf = p.get("tf", "5m").lower()
+    if tf not in BARS_TFS:
+        raise SliceError(400, "tf must be one of: " + ", ".join(BARS_TFS))
+    day = p.get("day", "today")
+    if day not in BARS_DAY_KEYS and not _DATE_RE.fullmatch(day):
+        raise SliceError(400, "day must be today, prev_weekday or YYYY-MM-DD")
+    out.update(symbol=symbol.upper() if symbol else None, tf=tf, day=day)
+    _paging(p, out, BARS_LIMIT_MAX)
+    for name in ("from", "to"):
+        if name in p:
+            out[name] = "%02d:%02d" % _hhmm(p, name)
+    if out["from"] and out["to"] and out["from"] > out["to"]:
+        raise SliceError(400, "from must be <= to")
+    return out
+
+
+def bars_slice(env, q):
+    """One symbol/timeframe/day page of [t_et, o, h, l, c, v] rows; the encoded reply stays <= SLICE_MAX."""
+    data = env["data"] if isinstance(env["data"], dict) else {}
+    symbols = _bars_symbols(data)
+    if q["symbol"] not in symbols:
+        raise SliceError(404, ("unknown symbol" if q["symbol"] else "symbol is required")
+                         + "; valid: " + (", ".join(list(symbols)[:60]) or "none"))
+    days = _bars_days(data)
+    match = [(k, d["date"]) for k, d in days.items() if q["day"] in (k, d["date"])]
+    if not match:
+        raise SliceError(404, "unknown day; valid: " + (", ".join(list(days) + [d["date"] for d in days.values()])
+                                                        or "none"))
+    key, date = match[0]
+    rows = _bar_rows((symbols[q["symbol"]].get(key) or {}).get(q["tf"]))
+    rows = [r for r in rows if (not q["from"] or r[0] >= q["from"]) and (not q["to"] or r[0] <= q["to"])]
+    body = {"ok": True, **_head("bars", env), "feed": data.get("feed") if isinstance(data.get("feed"), str) else None,
+            "data_stale": data.get("stale") if isinstance(data.get("stale"), bool) else True,
+            "symbol": q["symbol"], "tf": q["tf"], "day": date, "day_key": key,
+            "session": days[key].get("session") if isinstance(days[key].get("session"), str) else None,
+            "filters": {"from": q["from"], "to": q["to"]}, "bar_format": ["t_et", "o", "h", "l", "c", "v"]}
+    return _page(body, rows, q["offset"], q["limit"], SLICE_MAX)
+
+
+# name -> (parse_query, index, slice) for the routes that are never served whole by default
+SLICED = {"journals": (parse_journals_query, journals_index, journals_slice),
+          "nrs": (parse_nrs_query, nrs_index, nrs_slice),
+          "bars": (parse_bars_query, bars_index, bars_slice)}
 
 
 def sign(secret, timestamp, body):
@@ -905,11 +1207,12 @@ def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter
             if name not in OBSERVE_FILES:
                 return self._send(404, {"ok": False}, headers=nostore, extra=extra)
             extra += f" name={name}"
-            query = urllib.parse.urlsplit(self.path).query if name == "journals" else ""
+            parse, index, slice_ = SLICED.get(name, (None, None, None))
+            query = urllib.parse.urlsplit(self.path).query if parse else ""
             if query:
                 try:
-                    q = parse_journals_query(query)
-                except JournalsError as exc:
+                    q = parse(query)
+                except SliceError as exc:
                     return self._send(exc.status, {"ok": False, "error": exc.message}, headers=nostore, extra=extra)
             try:
                 data = read_snapshot(name)
@@ -917,16 +1220,17 @@ def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter
                 return self._send(404, {"ok": False, "error": "no snapshot yet"}, headers=nostore, extra=extra)
             except SnapshotBad:
                 return self._send(502, {"ok": False, "error": "bad snapshot"}, headers=nostore, extra=extra)
-            if name != "journals":
-                return self._send(200, data, headers=nostore, extra=extra)
+            if not parse or (query and q.get("full")):
+                return self._send(200, data, headers=nostore, extra=extra + (" view=full" if parse else ""))
             if not query:
-                return self._send(200, journals_index(data), headers=nostore, extra=extra + " view=index")
+                return self._send(200, index(data), headers=nostore, extra=extra + " view=index")
             extra += " view=slice"
             try:
-                body = journals_slice(data, q)
-            except JournalsError as exc:
+                body = slice_(data, q)
+            except SliceError as exc:
                 return self._send(exc.status, {"ok": False, "error": exc.message}, headers=nostore, extra=extra)
-            return self._send(200, body, headers=nostore, extra=extra + f" section={body['section']}")
+            return self._send(200, body, headers=nostore,
+                              extra=extra + (f" section={body['section']}" if "section" in body else f" tf={body['tf']}"))
 
         def _not_allowed(self):
             path = self._path()
