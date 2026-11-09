@@ -54,11 +54,18 @@ MARKET_PARAMS = {
     "history": {"bars": range(1, 261)},
     "filings": {"forms": "forms", "limit": range(1, 21)},
     "edu/drill": {"symbol": "symbol", "seed": range(0, 2 ** 31), "kind": ("identify", "reclaim"),
-                  "difficulty": ("easy", "normal", "hard")},
+                  "difficulty": ("easy", "normal", "hard"), "bars": range(20, 121), "compact": ("1",)},
     "edu/quiz": {"symbol": "symbol", "seed": range(0, 2 ** 31), "kind": ("candle", "ma_context", "next5"),
-                 "difficulty": ("easy", "normal", "hard")},
-    "edu/brief": {"date": "date"},
-    "edu/patterns": {"mark": ("reclaim",), "limit": range(1, 21)},
+                 "difficulty": ("easy", "normal", "hard"), "bars": range(20, 121), "compact": ("1",)},
+    "edu/brief": {"date": "date", "compact": ("1",)},
+    "edu/patterns": {"mark": ("reclaim",), "limit": range(1, 21), "bars": range(20, 121), "compact": ("1",)},
+}
+# The chat bot must never have to remember these: a 12 KB relay cap cannot carry a verbose drill.
+MARKET_EDU_DEFAULTS = {
+    "edu/drill": (("bars", "40"), ("compact", "1")),
+    "edu/quiz": (("bars", "40"), ("compact", "1")),
+    "edu/brief": (("compact", "1"),),
+    "edu/patterns": (("compact", "1"),),
 }
 MAX_BODY = 4096
 MAX_TASK_BODY = 6144
@@ -1133,6 +1140,10 @@ def market_target(target, method):
             valid = value in rule
         if not valid:
             raise SliceError(400, "invalid_query")
+    if method == "GET":
+        supplied = {name for name, _ in pairs}
+        pairs += [(name, value) for name, value in MARKET_EDU_DEFAULTS.get(endpoint, ())
+                  if name not in supplied]
     return "/v1" + route + ("?" + urllib.parse.urlencode(pairs) if pairs else "")
 
 

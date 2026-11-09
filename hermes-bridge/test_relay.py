@@ -1968,7 +1968,10 @@ class MarketRouteTest(unittest.TestCase):
                 self.assertEqual(json.loads(body), json.loads(self.upstream.body))
                 self.assertNotIn("X-Secret", headers)
                 method, target, sent, raw = self.upstream.requests[-1]
-                self.assertEqual((method, target, raw), ("GET", "/v1/" + path, b""))
+                expected = "/v1/" + path
+                if path.startswith("edu/"):
+                    expected += "?" + urllib.parse.urlencode(relay.MARKET_EDU_DEFAULTS[path])
+                self.assertEqual((method, target, raw), ("GET", expected, b""))
                 self.assertEqual(sent["Authorization"], "Bearer " + MARKET_SECRET)
                 self.assertNotIn(MARKET_KEY, str(sent))
 
@@ -1994,14 +1997,19 @@ class MarketRouteTest(unittest.TestCase):
         paths = ["history/ABC?bars=260", "filings/ABC?forms=8-K,10-Q,10-K,4&limit=20",
                  "edu/drill?symbol=ABC&seed=42&kind=identify&difficulty=normal",
                  "edu/quiz?symbol=ABC&seed=42&kind=next5&difficulty=hard",
-                 "edu/brief?date=today", "edu/brief?date=2020-02-29", "edu/patterns?mark=reclaim&limit=20"]
+                 "edu/brief?date=today", "edu/brief?date=2020-02-29", "edu/patterns?mark=reclaim&limit=20",
+                 "edu/drill?symbol=ABC&seed=42&kind=identify&bars=40&compact=1",
+                 "edu/quiz?bars=120&compact=1", "edu/brief?compact=1", "edu/patterns?bars=20&compact=1"]
         for path in paths:
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[0], 200)
                 target = self.upstream.requests[-1][1]
                 expected_path, query = path.split("?")
                 self.assertEqual(target.split("?")[0], "/v1/" + expected_path)
-                self.assertEqual(urllib.parse.parse_qs(target.split("?")[1]), urllib.parse.parse_qs(query))
+                expected = urllib.parse.parse_qs(query)
+                for name, value in relay.MARKET_EDU_DEFAULTS.get(expected_path, ()):
+                    expected.setdefault(name, [value])
+                self.assertEqual(urllib.parse.parse_qs(target.split("?")[1]), expected)
         for path in ("history/ABC?bars=0", "history/ABC?bars=261", "history/ABC?bars=1&bars=2",
                      "filings/ABC?forms=8-K,8-K", "filings/ABC?forms=FAKE", "filings/ABC?limit=21",
                      "edu/quiz?kind=identify", "edu/drill?seed=2147483648", "edu/drill?symbol=abc",
@@ -2010,6 +2018,32 @@ class MarketRouteTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[0], 400)
         self.assertEqual(len(self.upstream.requests), len(paths))
+
+    def test_edu_compact_defaults(self):
+        for path, expected in (("edu/drill", {"bars": ["40"], "compact": ["1"]}),
+                               ("edu/quiz?symbol=ABC", {"symbol": ["ABC"], "bars": ["40"], "compact": ["1"]}),
+                               ("edu/drill?bars=120", {"bars": ["120"], "compact": ["1"]}),
+                               ("edu/quiz?compact=1", {"compact": ["1"], "bars": ["40"]}),
+                               ("edu/brief", {"compact": ["1"]}),
+                               ("edu/patterns?limit=5", {"limit": ["5"], "compact": ["1"]})):
+            with self.subTest(path=path):
+                self.assertEqual(self.get(path)[0], 200)
+                target = self.upstream.requests[-1][1]
+                self.assertEqual(urllib.parse.parse_qs(target.split("?")[1]), expected)
+        for path in ("edu/drill?bars=19", "edu/drill?bars=121", "edu/drill?bars=40.0", "edu/drill?bars=",
+                     "edu/drill?bars=+40", "edu/quiz?bars=0", "edu/patterns?bars=121", "edu/drill?compact=0",
+                     "edu/drill?compact=true", "edu/brief?compact=2", "edu/patterns?compact=yes",
+                     "history/ABC?compact=1", "quote/ABC?compact=1", "edu/drill?bars=40&bars=60",
+                     "edu/brief?bars=40", "edu/drill?compact=1&compact=1"):
+            with self.subTest(path=path):
+                with self.assertRaises(relay.SliceError) as caught:
+                    relay.market_target("/market/" + path, "GET")
+                self.assertEqual(caught.exception.status, 400)
+        # Non-edu reads keep their exact query; POST answers never gain parameters.
+        self.assertEqual(self.get("quote/ABC")[0], 200)
+        self.assertEqual(self.upstream.requests[-1][1], "/v1/quote/ABC")
+        self.assertEqual(self.answer({"drill_id": "abc", "answer": "doji"})[0], 200)
+        self.assertEqual(self.upstream.requests[-1][1], "/v1/edu/drill/answer")
 
     def test_bad_queries(self):
         for query in ("url=http://evil", "symbol=ABC&symbol=DEF", "days=-1", "days=99999999999",

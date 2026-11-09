@@ -375,12 +375,20 @@ Market query allowlist (all optional; omitted values use gateway defaults):
 | quote, profile, sector | none |
 | history | `bars=1..260` |
 | filings | `forms=` unique comma list from `8-K,10-Q,10-K,4`; `limit=1..20` |
-| edu/drill | uppercase `symbol`; `seed=0..2147483647`; `kind=identify|reclaim`; `difficulty=easy|normal|hard` |
-| edu/quiz | uppercase `symbol`; same seed/difficulty; `kind=candle|ma_context|next5` |
-| edu/brief | `date=today` or a valid UTC calendar date from 1970 through today |
-| edu/patterns | `mark=reclaim`; `limit=1..20` |
+| edu/drill | uppercase `symbol`; `seed=0..2147483647`; `kind=identify|reclaim`; `difficulty=easy|normal|hard`; `bars=20..120`; `compact=1` |
+| edu/quiz | uppercase `symbol`; same seed/difficulty/bars/compact; `kind=candle|ma_context|next5` |
+| edu/brief | `date=today` or a valid UTC calendar date from 1970 through today; `compact=1` |
+| edu/patterns | `mark=reclaim`; `limit=1..20`; `bars=20..120`; `compact=1` |
+
+`compact` accepts only the literal `1`. On every `edu/*` GET the relay adds `compact=1` when the caller
+omitted it, and adds `bars=40` to `edu/drill` and `edu/quiz` when the caller omitted `bars`, so a default
+drill stays near 3 KB instead of the ~17 KB that used to return 413. Pass the parameters explicitly to
+override (`bars=120` is honoured as given). Non-`edu` routes and the POST answer routes are untouched.
+Compact drills/quizzes replace `bars` with `bar_columns`/`bar_rows` (`date,o,h,l,c,v,sma20`, prices at
+2 dp, SMA values still computed over the full history before trimming); a compact brief is the short
+text plus the top five movers each way; compact patterns are `example_columns`/`example_rows`.
 
 The relay deliberately supports only the documented pattern selector and conservative bounds where
-README ranges are unspecified. A large history, drill or briefing may exceed 12 KiB or take longer
-than 10 seconds; the relay returns its bounded error instead of relaxing these limits. Smaller
-history requests (`bars=40`, for example) are useful for bot tool budgets.
+README ranges are unspecified. Compact mode cannot be switched off through the relay. A large history
+request or a cold briefing may still exceed 12 KiB or take longer than 10 seconds; the relay returns its
+bounded error instead of relaxing these limits. Smaller history requests (`bars=40`, for example) are useful for bot tool budgets.
