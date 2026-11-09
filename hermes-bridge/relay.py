@@ -14,16 +14,20 @@ snapshots a host-side collector writes into OBSERVE_DIR (read-only mount); only
 the allowlisted file names are ever opened. /observe/journals, /observe/nrs and /observe/bars are sliced: no query
 -> a compact index, query -> one bounded page (journals: one bot's list; nrs: one market's section, ?full=1 the
 whole ~40 KB snapshot; bars: one symbol/timeframe/day).
+/market proxies only allowlisted gateway reads and drill/quiz answer submissions,
+with separate keys, limits and kill switch.
 """
 
 import collections
 import datetime
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
 import secrets
+import socket
 import stat
 import sys
 import threading
@@ -37,6 +41,25 @@ HOST = "0.0.0.0"
 PORT = 8080
 KILL_FILE = "/run/bridge/KILL"
 KILL_TASK_FILE = "/run/bridge/KILL_TASK"
+KILL_MARKET_FILE = "/run/bridge/KILL_MARKET"
+MAX_MARKET_BODY = 2 * 1024
+MAX_MARKET_RESPONSE = 12 * 1024
+MARKET_TIMEOUT = 10
+MARKET_PER_MINUTE = 30
+MARKET_PER_DAY = 600
+MARKET_SYMBOL_RE = re.compile(r"[A-Z]{1,5}([.-][A-Z]{1,2})?")
+MARKET_SECTOR_RE = re.compile(r"[a-z]+(?:-[a-z]+)*")
+MARKET_PARAMS = {
+    "quote": {}, "profile": {}, "sector": {},
+    "history": {"bars": range(1, 261)},
+    "filings": {"forms": "forms", "limit": range(1, 21)},
+    "edu/drill": {"symbol": "symbol", "seed": range(0, 2 ** 31), "kind": ("identify", "reclaim"),
+                  "difficulty": ("easy", "normal", "hard")},
+    "edu/quiz": {"symbol": "symbol", "seed": range(0, 2 ** 31), "kind": ("candle", "ma_context", "next5"),
+                 "difficulty": ("easy", "normal", "hard")},
+    "edu/brief": {"date": "date"},
+    "edu/patterns": {"mark": ("reclaim",), "limit": range(1, 21)},
+}
 MAX_BODY = 4096
 MAX_TASK_BODY = 6144
 MIN_KEY_LEN = 32
@@ -163,7 +186,34 @@ def load_config(env):
         "url": url,
         "task": load_task_config(env, keys),
         "observe": load_observe_config(env, keys),
+        "market": load_market_config(env, keys),
     }
+
+
+def load_market_config(env, bridge_keys):
+    """Return the /market config, or None (route disabled) if MARKET_KEYS is unset."""
+    keys = split_keys(env, "MARKET_KEYS")
+    if not keys:
+        return None
+    if any(len(k) < MIN_KEY_LEN for k in keys):
+        raise ConfigError(f"every MARKET_KEYS entry must be at least {MIN_KEY_LEN} chars")
+    if set(keys) & (set(bridge_keys) | set(split_keys(env, "TASK_KEYS")) | set(split_keys(env, "OBS_KEYS"))):
+        raise ConfigError("MARKET_KEYS must not share a key with BRIDGE_KEYS, TASK_KEYS or OBS_KEYS")
+    key = env.get("MARKET_UPSTREAM_KEY", "").strip()
+    if not key or any(ord(c) < 33 or ord(c) > 126 for c in key) or key in keys:
+        raise ConfigError("MARKET_UPSTREAM_KEY must be a separate, nonempty ASCII token")
+    url = env.get("MARKET_UPSTREAM_URL", "http://host.docker.internal:8790")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        valid = (parsed.scheme in ("http", "https") and parsed.hostname and parsed.port != 0
+                 and not parsed.username and not parsed.password and parsed.path in ("", "/")
+                 and not parsed.query and not parsed.fragment
+                 and all(33 <= ord(c) <= 126 for c in url) and "\\" not in url)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError("MARKET_UPSTREAM_URL must be an http(s) origin without credentials, query or fragment")
+    return {"keys": [k.encode() for k in keys], "key": key, "url": url.rstrip("/")}
 
 
 def load_observe_config(env, bridge_keys):
@@ -1025,14 +1075,171 @@ def post_signed(config, body):
         return False
 
 
+def market_target(target, method):
+    """Exact allowlisted path and canonical validated query; never use caller input as an origin."""
+    if len(target) > 2048 or any(ord(c) < 33 or ord(c) > 126 for c in target) or "#" in target:
+        raise SliceError(404, "not_found")
+    path, _, query = target.partition("?")
+    route = path.removeprefix("/market")
+    if not path.startswith("/market/"):
+        raise SliceError(404, "not_found")
+    if method == "POST":
+        if route not in ("/edu/drill/answer", "/edu/quiz/answer"):
+            raise SliceError(404, "not_found")
+        allowed = {}
+    elif method == "GET":
+        parts = route.split("/")
+        if len(parts) == 3 and parts[1] in ("quote", "history", "profile", "filings"):
+            if not MARKET_SYMBOL_RE.fullmatch(parts[2]):
+                raise SliceError(404, "not_found")
+            endpoint = parts[1]
+        elif (len(parts) == 3 and parts[1] == "sector" and len(parts[2]) <= 64
+              and MARKET_SECTOR_RE.fullmatch(parts[2])):
+            endpoint = "sector"
+        elif route in ("/edu/drill", "/edu/quiz", "/edu/brief", "/edu/patterns"):
+            endpoint = route[1:]
+        else:
+            raise SliceError(404, "not_found")
+        allowed = MARKET_PARAMS.get(endpoint, {})
+    else:
+        raise SliceError(404, "not_found")
+    try:
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=True,
+                                      max_num_fields=len(allowed), errors="strict")
+    except (ValueError, UnicodeError):
+        raise SliceError(400, "invalid_query") from None
+    if len(dict(pairs)) != len(pairs):
+        raise SliceError(400, "invalid_query")
+    for name, value in pairs:
+        rule = allowed.get(name)
+        if rule is None:
+            raise SliceError(400, "invalid_query")
+        if rule == "symbol":
+            valid = MARKET_SYMBOL_RE.fullmatch(value)
+        elif rule == "forms":
+            forms = value.split(",")
+            valid = len(forms) == len(set(forms)) and set(forms) <= {"8-K", "10-Q", "10-K", "4"}
+        elif rule == "date":
+            valid = value == "today"
+            if not valid and _DATE_RE.fullmatch(value):
+                try:
+                    today = datetime.datetime.now(datetime.timezone.utc).date()
+                    valid = datetime.date(1970, 1, 1) <= datetime.date.fromisoformat(value) <= today
+                except ValueError:
+                    pass
+        elif isinstance(rule, range):
+            valid = re.fullmatch(r"[0-9]{1,10}", value) and int(value) in rule
+        else:
+            valid = value in rule
+        if not valid:
+            raise SliceError(400, "invalid_query")
+    return "/v1" + route + ("?" + urllib.parse.urlencode(pairs) if pairs else "")
+
+
+def _unique_object(pairs):
+    if len(dict(pairs)) != len(pairs):
+        raise ValueError("duplicate field")
+    return dict(pairs)
+
+
+def parse_market_answer(raw, route):
+    """Validate without rewriting the JSON bytes sent to the gateway."""
+    try:
+        data = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant, object_pairs_hook=_unique_object)
+    except (UnicodeError, ValueError, RecursionError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    ids = ("id", "drill_id") if route == "/v1/edu/drill/answer" else ("id", "drill_id", "quiz_id")
+    if not any(set(data) == {name, "answer"} for name in ids):
+        return False
+    identifier = next(data[name] for name in ids if name in data)
+    return (isinstance(identifier, str) and re.fullmatch(r"[A-Za-z0-9_.=-]{1,1536}", identifier) is not None
+            and isinstance(data["answer"], str) and 1 <= len(data["answer"].strip()) <= 1000
+            and not any(ord(c) < 32 and c not in "\n\t" for c in data["answer"]))
+
+
+# Bound abandoned DNS/connect workers too; a slow upstream cannot create unbounded threads.
+_market_slots = threading.BoundedSemaphore(MARKET_PER_MINUTE)
+
+
+def forward_market(config, target, raw=None):
+    """A total ten-second deadline, capped JSON, no redirects, proxies or upstream error bodies."""
+    failure = (502, {"ok": False, "error": "upstream_unavailable"})
+    if not _market_slots.acquire(blocking=False):
+        return failure
+    done = threading.Event()
+    cancelled = threading.Event()
+    sockets = []
+    result = [failure]
+    parsed = urllib.parse.urlsplit(config["url"])
+    cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    conn = cls(parsed.hostname, parsed.port, timeout=MARKET_TIMEOUT)
+
+    def stop():
+        cancelled.set()
+        sock = sockets[0] if sockets else conn.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        conn.close()
+
+    def fetch():
+        try:
+            headers = {"Authorization": "Bearer " + config["key"], "Accept": "application/json"}
+            if raw is not None:
+                headers["Content-Type"] = "application/json"
+            conn.auto_open = 0
+            conn.connect()
+            sockets.append(conn.sock)  # HTTP/1.0 getresponse() detaches the connection's socket.
+            if cancelled.is_set():
+                return
+            conn.request("POST" if raw is not None else "GET", target, body=raw, headers=headers)
+            with conn.getresponse() as response:
+                if response.status != 200 or response.getheader("Content-Encoding", "identity") != "identity":
+                    return
+                body = response.read(MAX_MARKET_RESPONSE + 1)
+            if len(body) > MAX_MARKET_RESPONSE:
+                result[0] = (413, {"ok": False, "error": "response_too_large"})
+                return
+            data = json.loads(body.decode("utf-8"), parse_constant=_reject_constant,
+                              object_pairs_hook=_unique_object)
+            # Treat error envelopes as failures even when upstream incorrectly returns HTTP 200.
+            if not isinstance(data, dict) or data.get("ok") is False or data.get("error"):
+                return
+            encoded = json.dumps(data, allow_nan=False)
+            if any(json.dumps(k)[1:-1] in encoded for k in
+                   [config["key"], *(key.decode() for key in config["keys"])]):
+                return
+            if len(encoded.encode()) > MAX_MARKET_RESPONSE:
+                result[0] = (413, {"ok": False, "error": "response_too_large"})
+                return
+            result[0] = (200, data)
+        except (OSError, ValueError, UnicodeError, RecursionError, http.client.HTTPException):
+            pass
+        finally:
+            conn.close()
+            _market_slots.release()
+            done.set()
+
+    threading.Thread(target=fetch, daemon=True).start()
+    if not done.wait(MARKET_TIMEOUT):
+        stop()
+        return failure
+    return result[0]
+
+
 def log(status, nbytes, label, extra=""):
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"{ts} status={status} bytes={nbytes} from={label}{extra}", flush=True)
 
 
-def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter, journals_limiter):
+def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter, journals_limiter, market_limiter):
     task_config = config.get("task")
     observe_config = config.get("observe")
+    market_config = config.get("market")
     post_paths = {"/notify", "/task"} if task_config else {"/notify"}
     get_paths = {"/health", "/results"} if task_config else {"/health"}
     if observe_config:
@@ -1050,6 +1257,9 @@ def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter
             pass
 
         def _send(self, status, body, nbytes=0, label="-", headers=None, extra=""):
+            if getattr(self, "market_request", False):
+                headers = {**(headers or {}), "Cache-Control": "no-store"}
+                extra = " route=market"
             data = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -1057,13 +1267,32 @@ def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter
             for name, value in (headers or {}).items():
                 self.send_header(name, value)
             self.end_headers()
-            self.wfile.write(data)
-            log(status, nbytes, label, extra)
+            if self.command != "HEAD":
+                self.wfile.write(data)
+            if getattr(self, "market_request", False):
+                print(f"route=market status={status}", flush=True)
+            else:
+                log(status, nbytes, label, extra)
+
+        def parse_request(self):
+            if not super().parse_request():
+                return False
+            target = self.requestline.split()[1]
+            raw_path = target.partition("?")[0]
+            self.market_request = raw_path.startswith("/market") or "/market/" in raw_path
+            if self.market_request:
+                self.path = target
+                if self.command not in ("GET", "POST") or any(ord(c) < 32 for c in self.requestline):
+                    self._send(404, {"ok": False})
+                    return False
+            return True
 
         def _path(self):
             return urllib.parse.urlsplit(self.path).path
 
         def do_GET(self):
+            if self.market_request:
+                return self._market()
             path = self._path()
             if path == "/health":
                 self._send(200, {"ok": True})
@@ -1111,6 +1340,8 @@ def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter
             return self.rfile.read(length)
 
         def do_POST(self):
+            if self.market_request:
+                return self._market()
             path = self._path()
             if path in get_paths or is_observe(path):
                 return self._send(405, {"ok": False}, headers={"Allow": "GET"})
@@ -1187,6 +1418,37 @@ def make_handler(config, limiter, task_limiter, results_limiter, observe_limiter
                 return self._send(404, {"ok": False}, headers=nostore, extra=extra)
             return self._send(200, {"ok": True, "result": data}, headers=nostore, extra=extra)
 
+        def _market(self):
+            extra = " route=market"
+            if not market_config:
+                return self._send(404, {"ok": False}, extra=extra)
+            if os.path.exists(KILL_FILE) or os.path.exists(KILL_MARKET_FILE):
+                return self._send(503, {"ok": False}, extra=extra)
+            if len(self.headers.get_all("Authorization", [])) > 1:
+                return self._send(403, {"ok": False}, extra=extra)
+            if not self._authorized(market_config["keys"], extra):
+                return
+            wait = market_limiter.acquire()
+            if wait:
+                return self._send(429, {"ok": False}, headers={"Retry-After": str(wait)}, extra=extra)
+            try:
+                target = market_target(self.path, self.command)
+            except SliceError as exc:
+                return self._send(exc.status, {"ok": False, "error": exc.message}, extra=extra)
+            raw = None
+            if self.command == "POST":
+                if (self.headers.get_content_type() != "application/json"
+                        or len(self.headers.get_all("Content-Length", [])) != 1
+                        or self.headers.get("Transfer-Encoding") is not None):
+                    return self._send(400, {"ok": False}, extra=extra)
+                raw = self._read_body(MAX_MARKET_BODY, extra)
+                if raw is None:
+                    return
+                if not parse_market_answer(raw, target):
+                    return self._send(422, {"ok": False}, extra=extra)
+            status, body = forward_market(market_config, target, raw)
+            return self._send(status, body, extra=extra)
+
         def _observe(self, path):
             # Snapshot contents are never logged: only status and the name when it is allowlisted.
             # Kill switches and auth come before the name check so unauthenticated callers learn nothing.
@@ -1262,11 +1524,15 @@ def make_journals_limiter(clock=time.monotonic):
     return RateLimiter(clock=clock, windows=[(60.0, JOURNALS_PER_MINUTE)])
 
 
+def make_market_limiter(clock=time.monotonic):
+    return RateLimiter(per_minute=MARKET_PER_MINUTE, per_day=MARKET_PER_DAY, clock=clock)
+
+
 def make_server(config, host=HOST, port=PORT, limiter=None, task_limiter=None, results_limiter=None,
-                observe_limiter=None, journals_limiter=None):
+                observe_limiter=None, journals_limiter=None, market_limiter=None):
     handler = make_handler(config, limiter or RateLimiter(), task_limiter or make_task_limiter(),
                            results_limiter or make_results_limiter(), observe_limiter or make_observe_limiter(),
-                           journals_limiter or make_journals_limiter())
+                           journals_limiter or make_journals_limiter(), market_limiter or make_market_limiter())
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     return server
@@ -1280,7 +1546,8 @@ def main():
         return 2
     server = make_server(config)
     log("start", 0, "-", " task=" + ("on" if config["task"] else "off")
-        + " observe=" + ("on" if config["observe"] else "off"))
+        + " observe=" + ("on" if config["observe"] else "off")
+        + " market=" + ("on" if config["market"] else "off"))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

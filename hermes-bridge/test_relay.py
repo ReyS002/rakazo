@@ -1870,5 +1870,339 @@ class StartupTest(unittest.TestCase):
                     self.assertNotIn(needle, result.stdout + result.stderr)
 
 
+
+MARKET_KEY = "m" * 40
+MARKET_KEY2 = "n" * 40
+MARKET_SECRET = "fake-market-upstream-secret-only"
+
+
+class FakeMarketUpstream:
+    def __init__(self):
+        self.requests = []
+        self.status = 200
+        self.body = b'{"ok":true,"data":{"price":12.5,"stale":true}}'
+        self.delay = 0
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                outer.requests.append((self.command, self.path, dict(self.headers), body))
+                if outer.delay:
+                    threading.Event().wait(outer.delay)
+                try:
+                    self.send_response(outer.status)
+                    self.send_header("Content-Length", str(len(outer.body)))
+                    self.send_header("Location", outer.url + "/redirect-leak")
+                    self.send_header("X-Secret", MARKET_SECRET)
+                    self.end_headers()
+                    self.wfile.write(outer.body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            do_POST = do_GET
+
+        self.server = HTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    close = FakeUpstream.close
+
+
+class MarketRouteTest(unittest.TestCase):
+    call = RelayTest.call
+    raw_get = ObserveRouteTest.raw_get
+    tearDown = ObserveRouteTest.tearDown
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.kill = os.path.join(self.tmp.name, "KILL")
+        self.kill_market = os.path.join(self.tmp.name, "KILL_MARKET")
+        self.kill_observe = os.path.join(self.tmp.name, "KILL_OBSERVE")
+        for name, value in (("KILL_FILE", self.kill), ("KILL_MARKET_FILE", self.kill_market),
+                            ("KILL_OBSERVE_FILE", self.kill_observe), ("OBSERVE_DIR", self.tmp.name)):
+            patcher = unittest.mock.patch.object(relay, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.stdout = io.StringIO()
+        redirect = contextlib.redirect_stdout(self.stdout)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+        self.upstream = FakeMarketUpstream()
+        self.addCleanup(self.upstream.close)
+        self.env = {"BRIDGE_KEYS": KEY, "BRIDGE_HMAC_SECRET": SECRET,
+                    "HERMES_WEBHOOK_URL": "http://127.0.0.1:9/x", "TASK_KEYS": TASK_KEY,
+                    "TASK_HMAC_SECRET": TASK_SECRET, "HERMES_TASK_URL": "http://127.0.0.1:9/task",
+                    "OBS_KEYS": OBS_KEY, "MARKET_KEYS": f" {MARKET_KEY}, ,{MARKET_KEY2}",
+                    "MARKET_UPSTREAM_KEY": MARKET_SECRET, "MARKET_UPSTREAM_URL": self.upstream.url}
+        self.server = None
+        self.start()
+
+    def start(self, **over):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+        self.config = relay.load_config({**self.env, **over})
+        self.server = relay.make_server(self.config, host="127.0.0.1", port=0)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def get(self, path="quote/ABC", key=MARKET_KEY):
+        return self.call("/market/" + path, "GET", key=key)
+
+    def answer(self, body, kind="drill", **kw):
+        return self.call(f"/market/edu/{kind}/answer", "POST", body, key=MARKET_KEY, **kw)
+
+    def test_allowlist_and_auth_forwarding(self):
+        paths = ["quote/ABC", "quote/BRK.B", "history/ABCDE-AA", "profile/A", "filings/ABC",
+                 "edu/drill", "edu/quiz", "edu/brief", "edu/patterns"]
+        paths += ["sector/electronic-technology", "sector/finance"]
+        for path in paths:
+            with self.subTest(path=path):
+                code, headers, body = self.get(path)
+                self.assertEqual((code, headers["Cache-Control"]), (200, "no-store"))
+                self.assertEqual(json.loads(body), json.loads(self.upstream.body))
+                self.assertNotIn("X-Secret", headers)
+                method, target, sent, raw = self.upstream.requests[-1]
+                self.assertEqual((method, target, raw), ("GET", "/v1/" + path, b""))
+                self.assertEqual(sent["Authorization"], "Bearer " + MARKET_SECRET)
+                self.assertNotIn(MARKET_KEY, str(sent))
+
+    def test_traversal_ssrf_and_unknown_routes(self):
+        paths = ["/market", "/market/", "/market//quote/ABC", "/market/quote/../ABC",
+                 "/market/quote/%41BC", "/market/quote/%2e%2e", "/market/quote/%252e%252e",
+                 "/market/quote/ABC%2f..", "/market/quote/ABC%5c..", "/market/quote/ABC@evil",
+                 "/market/quote/ABC%0d%0aX-Secret:x", "/market/http://evil/quote/ABC",
+                 "http://evil/market/quote/ABC", "//market/quote/ABC", "//evil/market/quote/ABC",
+                 "/market/quote/ABC/", "/market/quote/abc", "/market/quote/ABCDEF", "/market/quote/A1",
+                 "/market/profile/ABC#leak", "/market/health", "/market/admin", "/market/edu/drill/answer"]
+        for path in paths:
+            with self.subTest(path=path):
+                code, body = self.raw_get(path, key=MARKET_KEY)
+                self.assertEqual(code, 404)
+                self.assertNotIn(b"evil", body)
+        self.assertEqual(self.upstream.requests, [])
+        for target in ("/market/quote/ABC\n", "/market/quote/ABC\r", "/market/quote/ABC\t"):
+            with self.assertRaises(relay.SliceError):
+                relay.market_target(target, "GET")
+
+    def test_documented_queries(self):
+        paths = ["history/ABC?bars=260", "filings/ABC?forms=8-K,10-Q,10-K,4&limit=20",
+                 "edu/drill?symbol=ABC&seed=42&kind=identify&difficulty=normal",
+                 "edu/quiz?symbol=ABC&seed=42&kind=next5&difficulty=hard",
+                 "edu/brief?date=today", "edu/brief?date=2020-02-29", "edu/patterns?mark=reclaim&limit=20"]
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(self.get(path)[0], 200)
+                target = self.upstream.requests[-1][1]
+                expected_path, query = path.split("?")
+                self.assertEqual(target.split("?")[0], "/v1/" + expected_path)
+                self.assertEqual(urllib.parse.parse_qs(target.split("?")[1]), urllib.parse.parse_qs(query))
+        for path in ("history/ABC?bars=0", "history/ABC?bars=261", "history/ABC?bars=1&bars=2",
+                     "filings/ABC?forms=8-K,8-K", "filings/ABC?forms=FAKE", "filings/ABC?limit=21",
+                     "edu/quiz?kind=identify", "edu/drill?seed=2147483648", "edu/drill?symbol=abc",
+                     "edu/drill?difficulty=expert", "edu/brief?date=2025-02-29", "edu/brief?date=9999-01-01",
+                     "edu/patterns?mark=unknown", "edu/patterns?limit=0"):
+            with self.subTest(path=path):
+                self.assertEqual(self.get(path)[0], 400)
+        self.assertEqual(len(self.upstream.requests), len(paths))
+
+    def test_bad_queries(self):
+        for query in ("url=http://evil", "symbol=ABC&symbol=DEF", "days=-1", "days=99999999999",
+                      "days=1.5", "days=1%0d%0aX:evil", "days=%252e%252e", "days=", "unknown=x"):
+            with self.subTest(query=query):
+                self.assertEqual(self.get("history/ABC?" + query)[0], 400)
+        self.assertEqual(self.call("/market/edu/drill/answer?answer=A", "POST",
+                                   {"id": "x", "answer": "A"}, key=MARKET_KEY)[0], 400)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_total_deadline_during_connect(self):
+        connected = threading.Event()
+        release = threading.Event()
+        connection = unittest.mock.MagicMock()
+        connection.sock = None
+
+        def connect():
+            connected.set()
+            release.wait(1)
+
+        connection.connect.side_effect = connect
+        with unittest.mock.patch.object(relay.http.client, "HTTPConnection", return_value=connection), \
+                unittest.mock.patch.object(relay, "MARKET_TIMEOUT", 0.05):
+            try:
+                code, _ = relay.forward_market(self.config["market"], "/quote/ABC")
+                self.assertTrue(connected.is_set())
+                self.assertEqual(code, 502)
+                connection.request.assert_not_called()
+            finally:
+                release.set()
+
+    def test_literal_tab_in_request_target(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        conn.connect()
+        try:
+            conn.sock.sendall(("GET /market/quote/ABC\t HTTP/1.1\r\nHost: localhost\r\n"
+                               "Authorization: Bearer " + MARKET_KEY + "\r\n\r\n").encode())
+            response = http.client.HTTPResponse(conn.sock)
+            response.begin()
+            self.assertEqual(response.status, 404)
+            response.read()
+        finally:
+            conn.close()
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_key_separation(self):
+        self.assertEqual(self.get(key=None)[0], 401)
+        for key in (KEY, TASK_KEY, OBS_KEY, MARKET_SECRET, "wrong" * 8):
+            self.assertEqual(self.get(key=key)[0], 403)
+        for key in (MARKET_KEY, MARKET_KEY2):
+            for path, method, body in (("/notify", "POST", {"message": "x"}),
+                                       ("/task", "POST", {"title": "t", "task": "x"}),
+                                       ("/results", "GET", None), ("/observe", "GET", None)):
+                self.assertEqual(self.call(path, method, body, key=key)[0], 403)
+            self.assertEqual(self.get(key=key)[0], 200)
+
+    def test_disabled_and_config_validation(self):
+        self.start(MARKET_KEYS=" , ")
+        self.assertIsNone(self.config["market"])
+        self.assertEqual(self.get()[0], 404)
+        self.assertEqual(self.answer({"id": "x", "answer": "A"})[0], 404)
+        for over in ({"MARKET_KEYS": "short"}, {"MARKET_KEYS": KEY}, {"MARKET_KEYS": OBS_KEY},
+                     {"MARKET_KEYS": TASK_KEY, "TASK_HMAC_SECRET": ""}, {"MARKET_UPSTREAM_KEY": ""},
+                     {"MARKET_UPSTREAM_KEY": "bad\nheader"}, {"MARKET_UPSTREAM_KEY": MARKET_KEY},
+                     *({"MARKET_UPSTREAM_URL": url} for url in ("file:///etc/passwd", "http://x/a",
+                       "http://user:fake-secret@x", "http://x?secret=fake", "http://x#fragment",
+                       "http://x\n", "http://x:bad", "http://[bad"))):
+            with self.subTest(over=over), self.assertRaises(relay.ConfigError) as ctx:
+                relay.load_config({**self.env, **over})
+            for needle in (MARKET_KEY, MARKET_SECRET, "fake-secret"):
+                self.assertNotIn(needle, str(ctx.exception))
+        env = {k: v for k, v in self.env.items() if k != "MARKET_UPSTREAM_URL"}
+        self.assertEqual(relay.load_config(env)["market"]["url"], "http://host.docker.internal:8790")
+
+    def test_methods(self):
+        for method in ("PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT", "BOGUS"):
+            code, headers, _ = self.call("/market/quote/ABC", method, key=MARKET_KEY)
+            self.assertEqual((code, headers["Cache-Control"]), (404, "no-store"))
+        self.assertEqual(self.call("/market/quote/ABC", "POST", {}, key=MARKET_KEY)[0], 404)
+        self.assertEqual(self.call("/market/edu/brief/answer", "POST", {}, key=MARKET_KEY)[0], 404)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_kill_switches(self):
+        for path in (self.kill, self.kill_market):
+            open(path, "w").close()
+            code, headers, _ = self.get()
+            self.assertEqual((code, headers["Cache-Control"]), (503, "no-store"))
+            self.assertEqual(self.answer({"id": "x", "answer": "A"})[0], 503)
+            os.remove(path)
+        open(self.kill_observe, "w").close()
+        self.assertEqual(self.get()[0], 200)
+        os.remove(self.kill_observe)
+        open(self.kill_market, "w").close()
+        self.assertEqual(self.call("/observe", "GET", key=OBS_KEY)[0], 200)
+
+    def test_rate_limit_and_independence(self):
+        for _ in range(30):
+            self.assertEqual(self.get()[0], 200)
+        code, headers, _ = self.answer({"id": "x", "answer": "A"})
+        self.assertEqual((code, headers["Cache-Control"]), (429, "no-store"))
+        self.assertGreaterEqual(int(headers["Retry-After"]), 1)
+        self.assertEqual(self.call("/observe", "GET", key=OBS_KEY)[0], 200)
+        now = [0.0]
+        limiter = relay.make_market_limiter(clock=lambda: now[0])
+        for batch in range(20):
+            now[0] = batch * 60.0
+            for _ in range(30):
+                self.assertEqual(limiter.acquire(), 0)
+            self.assertGreater(limiter.acquire(), 0)
+        now[0] += 60
+        self.assertGreater(limiter.acquire(), 80000)
+        now[0] = 86400
+        self.assertEqual(limiter.acquire(), 0)
+
+    def test_size_caps(self):
+        self.assertEqual(self.answer(b"x" * 2049)[0], 413)
+        for body in (b'{"pad":"' + b"x" * 12288 + b'"}', b'{"pad":"' + b"x" * 12279 + b'"}'):
+            self.upstream.body = body
+            code, headers, raw = self.get()
+            self.assertEqual((code, headers["Cache-Control"]), (413, "no-store"))
+            self.assertEqual(json.loads(raw), {"ok": False, "error": "response_too_large"})
+        self.upstream.body = json.dumps({"pad": "x" * (12288 - len(json.dumps({"pad": ""})))}).encode()
+        code, _, raw = self.get()
+        self.assertEqual((code, len(raw)), (200, 12288))
+
+    def test_upstream_errors_and_secret_leaks(self):
+        failure = {"ok": False, "error": "upstream_unavailable"}
+        cases = [(500, MARKET_SECRET.encode()), (401, b"planted-error-secret"), (302, b"redirect-secret"),
+                 (200, b"garbage-secret"), (200, b"{bad"), (200, b'{"x":NaN}'), (200, b"\xff"),
+                 (200, b"[" * 2000), (200, b'{"x":1,"x":2}'),
+                 (200, json.dumps({"ok": False, "error": "planted-error-secret"}).encode()),
+                 (200, json.dumps({"key": MARKET_SECRET}).encode()),
+                 (200, json.dumps({"key": MARKET_KEY}).encode())]
+        for status, body in cases:
+            with self.subTest(status=status, body=body[:30]):
+                self.upstream.status, self.upstream.body = status, body
+                code, headers, raw = self.get()
+                self.assertEqual((code, json.loads(raw)), (502, failure))
+                self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(len(self.upstream.requests), len(cases))
+        self.upstream.close()
+        self.assertEqual(self.get()[0], 502)
+        for line in self.stdout.getvalue().splitlines():
+            self.assertRegex(line, r"^route=market status=[0-9]{3}$")
+
+    def test_timeout(self):
+        self.upstream.delay = 0.3
+        with unittest.mock.patch.object(relay, "MARKET_TIMEOUT", 0.05):
+            code, _, body = self.get()
+        self.assertEqual((code, json.loads(body)), (502, {"ok": False, "error": "upstream_unavailable"}))
+        self.assertEqual(relay.MARKET_TIMEOUT, 10)
+
+    def test_post_framing(self):
+        cases = [([], 400), ([("Content-Length", "-1")], 400),
+                 ([("Content-Length", "bad")], 400), ([("Content-Length", "2049")], 413),
+                 ([("Content-Length", "0"), ("Content-Length", "1")], 400),
+                 ([("Content-Length", "0"), ("Transfer-Encoding", "chunked")], 400)]
+        for headers, expected in cases:
+            with self.subTest(headers=headers):
+                conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+                conn.putrequest("POST", "/market/edu/drill/answer")
+                conn.putheader("Authorization", "Bearer " + MARKET_KEY)
+                conn.putheader("Content-Type", "application/json")
+                for name, value in headers:
+                    conn.putheader(name, value)
+                conn.endheaders()
+                response = conn.getresponse()
+                self.assertEqual((response.status, response.getheader("Cache-Control")), (expected, "no-store"))
+                response.read()
+                conn.close()
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_post_schema_and_verbatim_body(self):
+        for kind in ("drill", "quiz"):
+            for field in ("id", kind + "_id"):
+                raw = ('{ "' + field + '": "sample-1.signed-token", "answer": "A" }').encode()
+                self.assertEqual(self.answer(raw, kind)[0], 200)
+                method, target, headers, sent = self.upstream.requests[-1]
+                self.assertEqual((method, target, sent), ("POST", f"/v1/edu/{kind}/answer", raw))
+                self.assertEqual(headers["Authorization"], "Bearer " + MARKET_SECRET)
+        for body in (b"garbage-secret", b"[]", b'{"id":"x","id":"y","answer":"A"}',
+                     {"id": "x"}, {"answer": "A"}, {"id": "x", "answer": ""},
+                     {"id": "x", "answer": "A", "extra": "leak"}, {"id": "x", "answer": []},
+                     {"id": "x", "answer": True}, {"id": "../x", "answer": "A"},
+                     {"quiz_id": "x", "answer": "A"}, {"id": "x", "answer": "A" * 1001},
+                     {"id": "x", "answer": "\x00"}):
+            with self.subTest(body=body):
+                self.assertEqual(self.answer(body)[0], 422)
+        self.assertEqual(self.answer({"id": "x", "answer": "A"}, headers={"Content-Type": "text/plain"})[0], 400)
+        self.assertEqual(len(self.upstream.requests), 4)
+        for needle in (MARKET_KEY, MARKET_SECRET, "sample-1", "garbage-secret", "leak", "Bearer"):
+            self.assertNotIn(needle, self.stdout.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

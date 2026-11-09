@@ -327,3 +327,60 @@ never paste it into `/notify` or `/task` as a command. It is read-only: nothing 
 cd /opt/stacks/bull-desk/hermes-bridge && python3 -m unittest -v
 cd /root/.hermes/profiles/rey-default/scripts && python3 test_bull_desk_task.py
 ```
+
+## Market data: `/market/*`
+
+Optional gateway proxy for saved credential `market_data` (Bearer). Public paths start with
+`/hermes-bridge/market/`; the gateway receives the same path with `/market` replaced by its documented `/v1` prefix.
+
+- `MARKET_KEYS`: comma-separated caller keys, each at least 32 characters; unset disables the route (404).
+  Keys must differ from every `BRIDGE_KEYS`, `TASK_KEYS`, and `OBS_KEYS` entry, including disabled routes.
+- `MARKET_UPSTREAM_URL`: HTTP(S) origin only, default `http://host.docker.internal:8790`.
+  Credentials, path prefixes, queries and fragments are rejected.
+- `MARKET_UPSTREAM_KEY`: required when enabled; a separate nonempty ASCII Bearer token for the gateway.
+  Invalid enabled configuration prevents startup. Caller Authorization is never forwarded.
+
+GET routes: `quote/{SYM}`, `history/{SYM}`, `profile/{SYM}`, `sector/{slug}`, `filings/{SYM}`,
+`edu/drill`, `edu/quiz`, `edu/brief`, `edu/patterns`. Symbols are uppercase and must match
+`[A-Z]{1,5}([.-][A-Z]{1,2})?`. Paths are exact: no decoding, traversal, absolute URLs or redirects.
+Sector slugs are at most 64 lowercase letters with single interior hyphens.
+Unknown/repeated query parameters and malformed values return 400 without echoing the input.
+
+The only POST routes are `edu/drill/answer` and `edu/quiz/answer`. Require `Content-Type: application/json`,
+a single Content-Length and no Transfer-Encoding; body at most 2048 bytes. Exactly two fields:
+`answer` (nonblank string, at most 1000 characters) plus `drill_id`, or `id`; quiz also accepts
+`quiz_id`. The gateway documents `drill_id` for both answer routes. IDs are 1..1536 ASCII
+letters/digits or `_ . = -`, allowing signed exercise tokens. Validated JSON is forwarded verbatim.
+Duplicate/unknown fields, invalid UTF-8, non-finite numbers and malformed JSON are rejected.
+All other routes and methods return 404. No trading or administration routes are exposed.
+
+Independent global sliding limits: 30/minute and 600/day across GET and POST, with 429 and Retry-After.
+`/run/bridge/KILL_MARKET` disables market requests (503); the existing `/run/bridge/KILL` also applies.
+Observe/task kill switches do not disable market requests. Files are checked on every request.
+
+Every market response has `Cache-Control: no-store`. Responses are limited to 12288 bytes, both as read
+and after JSON serialization; oversize replies return `413 {"ok":false,"error":"response_too_large"}`,
+never partial JSON. Upstream failures, redirects, invalid JSON and error envelopes return
+`502 {"ok":false,"error":"upstream_unavailable"}`. Upstream headers and error bodies are never relayed.
+The total upstream deadline is 10 seconds, including connection and body reads; background connection
+workers are bounded. Logs contain only `route=market status=<code>`.
+
+The unapplied bot instructions appendix is in `deploy/bull-mentor-market-appendix.md`.
+Use the returned daily historical/delayed data for education only; report missing/stale data honestly.
+
+Market query allowlist (all optional; omitted values use gateway defaults):
+
+| Route | Accepted query values |
+|---|---|
+| quote, profile, sector | none |
+| history | `bars=1..260` |
+| filings | `forms=` unique comma list from `8-K,10-Q,10-K,4`; `limit=1..20` |
+| edu/drill | uppercase `symbol`; `seed=0..2147483647`; `kind=identify|reclaim`; `difficulty=easy|normal|hard` |
+| edu/quiz | uppercase `symbol`; same seed/difficulty; `kind=candle|ma_context|next5` |
+| edu/brief | `date=today` or a valid UTC calendar date from 1970 through today |
+| edu/patterns | `mark=reclaim`; `limit=1..20` |
+
+The relay deliberately supports only the documented pattern selector and conservative bounds where
+README ranges are unspecified. A large history, drill or briefing may exceed 12 KiB or take longer
+than 10 seconds; the relay returns its bounded error instead of relaxing these limits. Smaller
+history requests (`bars=40`, for example) are useful for bot tool budgets.
